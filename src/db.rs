@@ -228,6 +228,28 @@ impl Database {
         .map_err(io::Error::other)
     }
 
+    pub fn file_fingerprints(&self, category: Category) -> io::Result<BTreeMap<String, (u64, i64)>> {
+        let rows = block_on(async {
+            sqlx::query("SELECT path, size, modified FROM files WHERE category = ?")
+                .bind(category_key(category))
+                .fetch_all(&self.pool)
+                .await
+        })
+        .map_err(io::Error::other)?;
+
+        let mut fingerprints = BTreeMap::new();
+        for row in rows {
+            fingerprints.insert(
+                row.get::<String, _>("path"),
+                (
+                    row.get::<i64, _>("size") as u64,
+                    row.get::<i64, _>("modified"),
+                ),
+            );
+        }
+        Ok(fingerprints)
+    }
+
     pub fn query_visible_rows(
         &self,
         category: Category,

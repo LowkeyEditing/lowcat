@@ -74,11 +74,26 @@ enum ImportProgressEvent {
 }
 
 impl Library {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::new_with_settings_path(config::settings_path())
     }
 
+    pub fn new_for_app(cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new_uninitialized(config::settings_path());
+        this.init_cached();
+        this.start_initial_rescan(cx);
+        this
+    }
+
+    #[allow(dead_code)]
     pub fn new_with_settings_path(settings_path: PathBuf) -> Self {
+        let mut this = Self::new_uninitialized(settings_path);
+        this.init();
+        this
+    }
+
+    fn new_uninitialized(settings_path: PathBuf) -> Self {
         let settings = config::Settings::load(&settings_path);
         let backend = Backend::new(database_path_for_settings(&settings_path))
             .expect("failed to initialize Lowcat SQLite database");
@@ -88,7 +103,7 @@ impl Library {
         let convert_conflict_behavior = backend
             .convert_conflict_behavior()
             .unwrap_or(ConvertConflictBehavior::AddCopy);
-        let mut this = Self {
+        Self {
             backend,
             active: Category::Music,
             states: BTreeMap::new(),
@@ -102,9 +117,7 @@ impl Library {
             import_progress: None,
             last_focus_rescan: None,
             focus_rescan_in_flight: false,
-        };
-        this.init();
-        this
+        }
     }
 
     pub fn active(&self) -> Category {
@@ -566,6 +579,7 @@ impl Library {
         cx.notify();
     }
 
+    #[allow(dead_code)]
     fn init(&mut self) {
         for category in Category::ALL {
             if let Some(path) = self
@@ -579,10 +593,33 @@ impl Library {
             }
         }
 
+        self.load_all_category_states();
+    }
+
+    fn init_cached(&mut self) {
+        for category in Category::ALL {
+            if let Some(path) = self
+                .settings
+                .category_folder(category)
+                .map(Path::to_path_buf)
+            {
+                self.backend.remember_category_folder(category, path);
+            }
+        }
+
+        self.load_all_category_states();
+    }
+
+    fn load_all_category_states(&mut self) {
         for category in Category::ALL {
             self.states
                 .insert(category, self.load_category_state(category));
         }
+    }
+
+    fn start_initial_rescan(&mut self, cx: &mut Context<Self>) {
+        eprintln!("lowcat initial scan scheduled");
+        self.rescan_after_focus(cx);
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {

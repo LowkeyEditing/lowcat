@@ -40,7 +40,7 @@ pub struct UI {
 
 impl UI {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let library = cx.new(|_| Library::new());
+        let library = cx.new(|cx| Library::new_for_app(cx));
         cx.observe(&library, |_, _, cx| cx.notify()).detach();
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
