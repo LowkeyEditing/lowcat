@@ -890,7 +890,12 @@ mod tests {
             BTreeSet::from(["Electronic".to_string()]),
         )]);
         let rows = db
-            .query_visible_rows(Category::Music, "dark", &selected, &default_format_priority())
+            .query_visible_rows(
+                Category::Music,
+                "dark",
+                &selected,
+                &default_format_priority(),
+            )
             .unwrap();
 
         assert_eq!(rows.len(), 1);

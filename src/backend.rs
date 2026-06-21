@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lofty::config::ParseOptions;
@@ -326,7 +326,7 @@ pub fn import_to_folder(
 }
 
 fn probe_is_audio(path: &Path) -> bool {
-    Command::new("ffprobe")
+    crate::media_tools::command("ffprobe")
         .args([
             "-v",
             "error",
@@ -426,7 +426,7 @@ fn convert_media(
 ) -> io::Result<()> {
     let duration_us = media_duration_us(source);
     on_progress(0.);
-    let mut child = Command::new("ffmpeg")
+    let mut child = crate::media_tools::command("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
@@ -459,7 +459,7 @@ fn convert_media(
 }
 
 fn media_duration_us(path: &Path) -> Option<f64> {
-    let output = Command::new("ffprobe")
+    let output = crate::media_tools::command("ffprobe")
         .args([
             "-v",
             "error",

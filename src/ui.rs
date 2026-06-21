@@ -16,9 +16,9 @@ use gpui_component::{
 };
 
 use crate::model::Category;
+use crate::ui::titlebar::TITLEBAR_LEFT_OFFSET;
 #[cfg(target_os = "macos")]
 use crate::{CloseWindow, MinimizeWindow};
-use crate::ui::titlebar::TITLEBAR_LEFT_OFFSET;
 
 actions!(library, [NextCategory, PreviousCategory, ToggleFilters]);
 
@@ -41,8 +41,7 @@ pub struct UI {
 }
 
 impl UI {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let library = cx.new(|cx| Library::new_for_app(cx));
+    pub fn new(library: Entity<Library>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.observe(&library, |_, _, cx| cx.notify()).detach();
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
@@ -372,8 +371,7 @@ impl Render for UI {
                 window.remove_window();
             });
 
-        root
-            .child(self.titlebar.clone())
+        root.child(self.titlebar.clone())
             .child(self.toolbar.clone())
             .when(filters_open, |el| el.child(self.filter_panel.clone()))
             .child(self.table.clone())

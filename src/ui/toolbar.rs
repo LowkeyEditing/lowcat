@@ -57,7 +57,10 @@ impl Toolbar {
     }
 
     pub fn search_is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.search_input.read(cx).focus_handle(cx).is_focused(window)
+        self.search_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
     }
 }
 
