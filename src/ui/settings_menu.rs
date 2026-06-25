@@ -6,6 +6,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Selectable, Sizable, StyledExt, button::Button,
+    tooltip::Tooltip,
 };
 
 use crate::library::Library;
@@ -160,6 +161,20 @@ impl Render for SettingsMenu {
                         .id("settings-format-priority")
                         .hover(|style| style.bg(cx.theme().accent))
                         .when(show_priority_menu, |style| style.bg(cx.theme().accent))
+                        .tooltip(|window, cx| {
+                            let tooltip_width = (window.bounds().size.width - px(48.))
+                                .max(px(80.))
+                                .min(px(340.));
+                            Tooltip::element(move |_, _| {
+                                div()
+                                    .w(tooltip_width)
+                                    .min_w_0()
+                                    .child(
+                                        "When dragging multiple selected rows, missing extensions fall back to the first available format in this order.",
+                                    )
+                            })
+                            .build(window, cx)
+                        })
                         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                             if *hovered {
                                 this.activate_submenu(SettingsSubmenu::Priority, "row", cx);
