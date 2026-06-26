@@ -287,8 +287,19 @@ impl FileTable {
         };
         let value = raw.trim();
         if !value.is_empty() {
-            self.library
-                .update(cx, |lib, cx| lib.add_tag(path, &key, value, cx));
+            let paths = {
+                let library = self.library.read(cx);
+                self.selected_tag_paths(&library.active_state().results, &path)
+            };
+            let path_count = paths.len();
+            debug_table_interaction(|| {
+                format!("tag add key={key} value={value} paths={path_count}")
+            });
+            self.library.update(cx, |lib, cx| {
+                for path in paths {
+                    lib.add_tag(path, &key, value, cx);
+                }
+            });
         }
         self.focus_handle.focus(window, cx);
         window.refresh();
@@ -440,6 +451,21 @@ impl FileTable {
                 .map(|variant| vec![variant.path.clone()])
                 .unwrap_or_default()
         }
+    }
+
+    fn selected_tag_paths(&self, records: &[FileRecord], path: &Path) -> Vec<PathBuf> {
+        if self.selected.len() > 1 && self.selected.contains(path) {
+            let paths: Vec<PathBuf> = records
+                .iter()
+                .filter(|record| self.selected.contains(record.path.as_path()))
+                .map(|record| record.path.clone())
+                .collect();
+            if !paths.is_empty() {
+                return paths;
+            }
+        }
+
+        vec![path.to_path_buf()]
     }
 
     fn conversion_actions(
@@ -1194,9 +1220,23 @@ impl FileTable {
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, window, cx| {
                                             if event.modifiers().alt {
-                                                let path = path.clone();
+                                                let paths = {
+                                                    let library = this.library.read(cx);
+                                                    this.selected_tag_paths(
+                                                        &library.active_state().results,
+                                                        &path,
+                                                    )
+                                                };
+                                                let path_count = paths.len();
+                                                debug_table_interaction(|| {
+                                                    format!(
+                                                        "tag remove key={key} value={value} paths={path_count}"
+                                                    )
+                                                });
                                                 this.library.update(cx, |lib, cx| {
-                                                    lib.remove_tag(path, &key, &value, cx)
+                                                    for path in paths {
+                                                        lib.remove_tag(path, &key, &value, cx);
+                                                    }
                                                 });
                                                 window.refresh();
                                                 cx.notify();
