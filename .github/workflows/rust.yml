@@ -25,6 +25,9 @@ jobs:
       - name: Install FFmpeg
         run: brew install ffmpeg
 
+      - name: Install yt-dlp
+        run: brew install yt-dlp
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
