@@ -194,8 +194,8 @@ impl Render for Toolbar {
         let filters_open = self.library.read(cx).filters_open();
         let filter_button = Button::new("filter-toggle")
             .icon(IconName::Settings2)
-            .label("Filter")
             .small()
+            .tooltip("Filter")
             .selected(filters_open)
             .on_click(cx.listener(|this, _, _, cx| {
                 this.library.update(cx, |lib, cx| lib.toggle_filters(cx));
