@@ -132,6 +132,10 @@ impl UI {
             || self.table.read(cx).tag_editor_is_focused(window, cx)
     }
 
+    fn tag_editor_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.table.read(cx).tag_editor_is_focused(window, cx)
+    }
+
     fn cancel_search_if_no_selection(
         &mut self,
         window: &mut Window,
@@ -430,6 +434,15 @@ impl Render for UI {
                     this.cancel_file_drag(cx);
                     cx.stop_propagation();
                 } else if event.keystroke.key == "enter" && this.confirm_delete(cx) {
+                    cx.stop_propagation();
+                } else if event.keystroke.modifiers.platform
+                    && event.keystroke.key == "a"
+                    && !this.tag_editor_is_focused(window, cx)
+                    && this
+                        .table
+                        .update(cx, |table, cx| table.select_all_visible(window, cx))
+                {
+                    debug_ui_interaction(|| "cmd-a selected visible rows".to_string());
                     cx.stop_propagation();
                 } else if this.library.read(cx).downloader_open()
                     && event.keystroke.modifiers.platform

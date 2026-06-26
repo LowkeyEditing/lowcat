@@ -640,6 +640,34 @@ impl FileTable {
             .any(|record| self.selected.contains(record.path.as_path()))
     }
 
+    pub fn select_all_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let paths: Vec<PathBuf> = self
+            .library
+            .read(cx)
+            .active_state()
+            .results
+            .iter()
+            .map(|record| record.path.clone())
+            .collect();
+
+        if paths.is_empty() {
+            return false;
+        }
+
+        let selected: BTreeSet<PathBuf> = paths.iter().cloned().collect();
+        if self.selected == selected {
+            self.focus_handle.focus(window, cx);
+            return true;
+        }
+
+        self.selection_anchor = paths.first().cloned();
+        self.selected = selected;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+        debug_table_interaction(|| format!("select all visible rows={}", self.selected.len()));
+        true
+    }
+
     fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
         if self.selected.is_empty() && self.selection_anchor.is_none() {
             return false;
