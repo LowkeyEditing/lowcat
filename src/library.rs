@@ -6,12 +6,14 @@ use std::time::{Duration, Instant};
 
 use gpui::{AppContext as _, Context, EventEmitter};
 
-use crate::backend::{Backend, RenameRecord};
+use crate::backend::{
+    Backend, RenameRecord, TrimBuildRequest, TrimGenerationGate, TrimGenerationOutcome,
+};
 use crate::downloader::{DownloadCancel, DownloadState};
 use crate::model::{
     AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
-    default_format_priority, fuzzy_search_match, normalize_tag_key, record_matches_scoped,
-    record_search_sort_key_scoped, tag_label,
+    TrimArtifactState, TrimRange, default_format_priority, fuzzy_search_match, normalize_tag_key,
+    record_matches_scoped, record_search_sort_key_scoped, tag_label,
 };
 use crate::preview_player::{PreviewPlayer, PreviewPosition};
 
@@ -50,6 +52,8 @@ pub struct Library {
     waveform_cache_in_flight: bool,
     waveform_cache_skipped_paths: BTreeSet<PathBuf>,
     waveform_priority_cache_in_flight: BTreeSet<PathBuf>,
+    trim_generations: BTreeMap<PathBuf, TrimGeneration>,
+    next_trim_generation_token: u64,
     preview_player: Option<PreviewPlayer>,
     preview_current_path: Option<PathBuf>,
     preview_last_stopped: Option<PreviewPosition>,
@@ -71,6 +75,12 @@ impl EventEmitter<LibraryEvent> for Library {}
 struct InternalFileDrag {
     category: Category,
     paths: Vec<PathBuf>,
+}
+
+struct TrimGeneration {
+    token: u64,
+    gate: TrimGenerationGate,
+    state: TrimArtifactState,
 }
 
 #[derive(Clone)]
@@ -144,6 +154,8 @@ impl Library {
             waveform_cache_in_flight: false,
             waveform_cache_skipped_paths: BTreeSet::new(),
             waveform_priority_cache_in_flight: BTreeSet::new(),
+            trim_generations: BTreeMap::new(),
+            next_trim_generation_token: 0,
             preview_player: None,
             preview_current_path: None,
             preview_last_stopped: None,
@@ -727,9 +739,15 @@ impl Library {
         cx: &mut Context<Self>,
     ) {
         let category = self.active;
+        let trim_paths = records
+            .iter()
+            .flat_map(|record| record.paths.iter().cloned())
+            .collect::<Vec<_>>();
+        self.invalidate_trim_generations(&trim_paths);
         match self.backend.rename_records(category, &records, new_stem) {
             Ok(file_count) => {
                 self.refresh_category_state(category);
+                self.retry_trim_artifacts(cx);
                 debug_library_interaction(|| {
                     format!(
                         "rename_records category={} records={} files={file_count}",
@@ -745,6 +763,8 @@ impl Library {
                     category.label(),
                     records.len()
                 );
+                self.refresh_category_state(category);
+                self.retry_trim_artifacts(cx);
                 cx.notify();
             }
         }
@@ -949,6 +969,245 @@ impl Library {
         }
     }
 
+    pub(crate) fn commit_trim(
+        &mut self,
+        row_path: &Path,
+        range: TrimRange,
+        cx: &mut Context<Self>,
+    ) {
+        let variants = self
+            .active_state()
+            .all_records
+            .iter()
+            .find(|record| {
+                record.path == row_path
+                    || record
+                        .variants
+                        .iter()
+                        .any(|variant| variant.path == row_path)
+            })
+            .map(|record| record.variants.clone());
+        let Some(variants) = variants else {
+            return;
+        };
+        match self.backend.set_trim_range(&variants, range) {
+            Ok(requests) => {
+                for request in requests {
+                    self.schedule_trim_generation(self.active, request, cx);
+                }
+                self.refresh_category_state(self.active);
+            }
+            Err(error) => {
+                eprintln!(
+                    "lowcat trim persistence failed row={} error={error}",
+                    row_path.display()
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_trim(&mut self, row_path: &Path, cx: &mut Context<Self>) {
+        let paths = self
+            .active_state()
+            .all_records
+            .iter()
+            .find(|record| {
+                record.path == row_path
+                    || record
+                        .variants
+                        .iter()
+                        .any(|variant| variant.path == row_path)
+            })
+            .map(|record| {
+                record
+                    .variants
+                    .iter()
+                    .map(|variant| variant.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            return;
+        }
+        self.invalidate_trim_generations(&paths);
+        if let Err(error) = self.backend.clear_trims(&paths) {
+            eprintln!(
+                "lowcat trim cancellation failed row={} error={error}",
+                row_path.display()
+            );
+        }
+        self.refresh_category_state(self.active);
+        cx.notify();
+    }
+
+    pub(crate) fn external_drag_paths(
+        &self,
+        original_paths: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, TrimArtifactState> {
+        original_paths
+            .iter()
+            .map(|path| {
+                let record = self
+                    .states
+                    .values()
+                    .flat_map(|state| state.all_records.iter())
+                    .find(|record| record.variants.iter().any(|variant| variant.path == *path));
+                let Some(record) = record else {
+                    return Ok(path.clone());
+                };
+                let Some(variant) = record.variants.iter().find(|variant| variant.path == *path)
+                else {
+                    return Ok(path.clone());
+                };
+                if variant.trim.is_none() {
+                    return Ok(path.clone());
+                }
+                if let Some(generation) = self.trim_generations.get(path)
+                    && generation.state != TrimArtifactState::Ready
+                {
+                    return Err(generation.state);
+                }
+                let external_path = if record.path == *path {
+                    record.external_drag_path()
+                } else {
+                    variant.external_drag_path()
+                };
+                external_path
+                    .filter(|artifact| artifact.is_file())
+                    .cloned()
+                    .ok_or(
+                        variant
+                            .trim_artifact_state
+                            .unwrap_or(TrimArtifactState::Missing),
+                    )
+            })
+            .collect()
+    }
+
+    fn schedule_trim_generation(
+        &mut self,
+        category: Category,
+        request: TrimBuildRequest,
+        cx: &mut Context<Self>,
+    ) {
+        self.next_trim_generation_token = self.next_trim_generation_token.wrapping_add(1).max(1);
+        let token = self.next_trim_generation_token;
+        let gate = self
+            .trim_generations
+            .get(&request.source_path)
+            .map(|generation| generation.gate.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(token)));
+        *gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = token;
+        self.trim_generations.insert(
+            request.source_path.clone(),
+            TrimGeneration {
+                token,
+                gate: gate.clone(),
+                state: TrimArtifactState::Building,
+            },
+        );
+
+        let source_path = request.source_path.clone();
+        let db_path = database_path_for_settings(&self.settings_path);
+        let task = cx.background_spawn(async move {
+            let backend = Backend::new(db_path)?;
+            backend.generate_trim_artifact(&request, &gate, token)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |library, cx| {
+                let is_current = library
+                    .trim_generations
+                    .get(&source_path)
+                    .is_some_and(|generation| generation.token == token);
+                if !is_current {
+                    return;
+                }
+                match result {
+                    Ok(TrimGenerationOutcome::Published) => {
+                        library.trim_generations.remove(&source_path);
+                    }
+                    Ok(TrimGenerationOutcome::Superseded) => return,
+                    Err(error) => {
+                        if let Some(generation) = library.trim_generations.get_mut(&source_path) {
+                            generation.state = TrimArtifactState::Failed;
+                        }
+                        eprintln!(
+                            "lowcat trim generation failed source={} error={error}",
+                            source_path.display()
+                        );
+                    }
+                }
+                library.refresh_category_state(category);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn retry_trim_artifacts(&mut self, cx: &mut Context<Self>) {
+        let mut seen = BTreeSet::new();
+        let pending = self
+            .states
+            .iter()
+            .flat_map(|(category, state)| {
+                state.all_records.iter().flat_map(move |record| {
+                    record
+                        .variants
+                        .iter()
+                        .map(move |variant| (*category, variant))
+                })
+            })
+            .filter(|(_, variant)| {
+                variant.trim.is_some()
+                    && matches!(
+                        variant.trim_artifact_state,
+                        Some(TrimArtifactState::Missing | TrimArtifactState::Stale)
+                    )
+            })
+            .filter(|(_, variant)| seen.insert(variant.path.clone()))
+            .map(|(category, variant)| (category, variant.clone(), variant.trim.unwrap()))
+            .collect::<Vec<_>>();
+
+        for (category, variant, range) in pending {
+            if self
+                .trim_generations
+                .get(&variant.path)
+                .is_some_and(|generation| generation.state == TrimArtifactState::Building)
+            {
+                continue;
+            }
+            match self
+                .backend
+                .set_trim_range(std::slice::from_ref(&variant), range)
+            {
+                Ok(requests) => {
+                    for request in requests {
+                        self.schedule_trim_generation(category, request, cx);
+                    }
+                }
+                Err(error) => eprintln!(
+                    "lowcat trim retry preparation failed source={} error={error}",
+                    variant.path.display()
+                ),
+            }
+        }
+    }
+
+    fn invalidate_trim_generations(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            if let Some(generation) = self.trim_generations.remove(path) {
+                let mut token = generation
+                    .gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *token = token.wrapping_add(1);
+            }
+        }
+    }
+
     pub fn set_category_folder(
         &mut self,
         category: Category,
@@ -1019,6 +1278,8 @@ impl Library {
                 let _ = self.backend.refresh_category(category);
             }
         }
+
+        let _ = self.backend.reconcile_orphan_trims();
 
         self.load_all_category_states();
     }
@@ -1095,7 +1356,10 @@ impl Library {
         };
         let schema_start = crate::perf::start();
         let schema = display_schema(self.backend.schema_for(category));
-        let all_records = display_records(self.backend.filter(category, "", &BTreeMap::new()));
+        let all_records = display_records(
+            self.backend.filter(category, "", &BTreeMap::new()),
+            &self.trim_generations,
+        );
         let intersections = tag_intersections(&all_records);
         let mut configured = self
             .intersection_tags
@@ -1179,11 +1443,15 @@ impl Library {
         self.focus_rescan_in_flight = false;
         match result {
             Ok(()) => {
+                if !self.importing {
+                    let _ = self.backend.reconcile_orphan_trims();
+                }
                 for category in Category::ALL {
                     self.refresh_category_state(category);
                 }
                 self.stop_preview_if_missing(cx);
                 self.maybe_start_waveform_cache(cx);
+                self.retry_trim_artifacts(cx);
             }
             Err(error) => {
                 eprintln!(
@@ -1211,11 +1479,10 @@ impl Library {
 
     fn load_category_state(&self, category: Category) -> CategoryState {
         let schema = display_schema(self.backend.schema_for(category));
-        let all_records = Arc::new(display_records(self.backend.filter(
-            category,
-            "",
-            &BTreeMap::new(),
-        )));
+        let all_records = Arc::new(display_records(
+            self.backend.filter(category, "", &BTreeMap::new()),
+            &self.trim_generations,
+        ));
         let results = all_records.as_ref().clone();
         CategoryState {
             schema,
@@ -1321,17 +1588,34 @@ where
     (!has_exact_match, key.to_lowercase())
 }
 
-fn display_records(records: Vec<FileRecord>) -> Vec<FileRecord> {
-    records.into_iter().map(display_record).collect()
+fn display_records(
+    records: Vec<FileRecord>,
+    trim_generations: &BTreeMap<PathBuf, TrimGeneration>,
+) -> Vec<FileRecord> {
+    records
+        .into_iter()
+        .map(|record| display_record(record, trim_generations))
+        .collect()
 }
 
-fn display_record(record: FileRecord) -> FileRecord {
+fn display_record(
+    record: FileRecord,
+    trim_generations: &BTreeMap<PathBuf, TrimGeneration>,
+) -> FileRecord {
+    let mut variants = record.variants;
+    for variant in &mut variants {
+        if variant.trim.is_some()
+            && let Some(generation) = trim_generations.get(&variant.path)
+        {
+            variant.trim_artifact_state = Some(generation.state);
+        }
+    }
     FileRecord {
         name: record.name,
         path: record.path,
         support: record.support,
         stem: record.stem,
-        variants: record.variants,
+        variants,
         tags: display_schema(record.tags),
     }
 }

@@ -46,6 +46,28 @@ pub(super) async fn migrate_files_preview_waveform(pool: &SqlitePool) -> Result<
     Ok(())
 }
 
+pub(super) async fn migrate_trims(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS trims (
+            source_path TEXT NOT NULL PRIMARY KEY,
+            start_ratio REAL NOT NULL CHECK(start_ratio >= 0 AND start_ratio < end_ratio),
+            end_ratio REAL NOT NULL CHECK(end_ratio <= 1),
+            artifact_path TEXT NOT NULL,
+            source_size INTEGER NOT NULL,
+            source_modified INTEGER NOT NULL,
+            artifact_start_ratio REAL,
+            artifact_end_ratio REAL,
+            CHECK(
+                (artifact_start_ratio IS NULL AND artifact_end_ratio IS NULL)
+                OR (artifact_start_ratio >= 0 AND artifact_start_ratio < artifact_end_ratio AND artifact_end_ratio <= 1)
+            )
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub(super) async fn migrate_tag_keys(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     if has_column(pool, "tag_keys", "category").await? {
         return Ok(());

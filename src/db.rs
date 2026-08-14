@@ -9,19 +9,19 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::executor::block_on;
-use sea_query::{Alias, Expr, Query, SqliteQueryBuilder};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use migrations::{
-    migrate_files_first_seen_at, migrate_files_preview_waveform, migrate_tag_keys,
+    migrate_files_first_seen_at, migrate_files_preview_waveform, migrate_tag_keys, migrate_trims,
     seed_default_tag_keys, seed_tag_keys_from_values,
 };
 
 use crate::model::{
     AudioFormat, Category, ConvertConflictBehavior, FileRecord, FileSupport, FileVariant,
-    WaveformBinary256, default_format_priority, normalize_format_priority, normalize_tag_key,
-    normalize_tag_value, record_matches_scoped, record_search_sort_key_scoped,
+    TrimArtifactState, TrimRange, WaveformBinary256, default_format_priority,
+    normalize_format_priority, normalize_tag_key, normalize_tag_value, record_matches_scoped,
+    record_search_sort_key_scoped,
 };
 
 const FORMAT_PRIORITY_KEY: &str = "format_priority";
@@ -42,6 +42,27 @@ struct FileRow {
     modified: i64,
     first_seen_at: i64,
     preview_waveform: Option<WaveformBinary256>,
+    trim: Option<TrimRange>,
+    trim_artifact_path: Option<PathBuf>,
+    trim_artifact_state: Option<TrimArtifactState>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TrimRecord {
+    pub source_path: PathBuf,
+    pub range: TrimRange,
+    pub artifact_path: PathBuf,
+    pub source_size: u64,
+    pub source_modified: i64,
+    pub artifact_range: Option<TrimRange>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TrimInheritanceCandidate {
+    pub source_path: PathBuf,
+    pub size: u64,
+    pub modified: i64,
+    pub range: TrimRange,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +141,7 @@ impl Database {
             migrate_tag_keys(&self.pool).await?;
             migrate_files_first_seen_at(&self.pool).await?;
             migrate_files_preview_waveform(&self.pool).await?;
+            migrate_trims(&self.pool).await?;
             seed_tag_keys_from_values(&self.pool).await?;
             seed_default_tag_keys(&self.pool).await?;
 
@@ -135,16 +157,18 @@ impl Database {
     ) -> io::Result<SyncSummary> {
         block_on(async {
             let category_key = category_key(category);
-            let mut next_first_seen_at = current_unix_millis();
             let mut tx = self.pool.begin().await?;
-            let existing_rows =
-                sqlx::query("SELECT path, stem, size, modified FROM files WHERE category = ?")
-                    .bind(category_key)
-                    .fetch_all(&mut *tx)
-                    .await?;
+            let existing_rows = sqlx::query(
+                "SELECT path, stem, size, modified, first_seen_at FROM files WHERE category = ?",
+            )
+            .bind(category_key)
+            .fetch_all(&mut *tx)
+            .await?;
             let mut existing = BTreeMap::new();
             let mut existing_stems = BTreeSet::new();
+            let mut max_first_seen_at = 0;
             for row in existing_rows {
+                max_first_seen_at = max_first_seen_at.max(row.get::<i64, _>("first_seen_at"));
                 existing_stems.insert(row.get::<String, _>("stem"));
                 existing.insert(
                     row.get::<String, _>("path"),
@@ -154,6 +178,8 @@ impl Database {
                     ),
                 );
             }
+            let mut next_first_seen_at =
+                current_unix_millis().max(max_first_seen_at.saturating_add(1));
 
             let mut seen = BTreeSet::new();
             let mut summary = SyncSummary::default();
@@ -378,6 +404,9 @@ impl Database {
                 modified: row.modified,
                 first_seen_at: row.first_seen_at,
                 waveform: row.preview_waveform,
+                trim: row.trim,
+                trim_artifact_path: row.trim_artifact_path,
+                trim_artifact_state: row.trim_artifact_state,
             });
         }
 
@@ -479,6 +508,218 @@ impl Database {
         .map_err(io::Error::other)
     }
 
+    pub(crate) fn trim_for_path(&self, path: &Path) -> io::Result<Option<TrimRecord>> {
+        let row = block_on(async {
+            sqlx::query(
+                "SELECT source_path, start_ratio, end_ratio, artifact_path, source_size,
+                        source_modified, artifact_start_ratio, artifact_end_ratio
+                 FROM trims WHERE source_path = ?",
+            )
+            .bind(path.to_string_lossy().as_ref())
+            .fetch_optional(&self.pool)
+            .await
+        })
+        .map_err(io::Error::other)?;
+        Ok(row.and_then(trim_record_from_sql))
+    }
+
+    pub(crate) fn set_trim(
+        &self,
+        source_path: &Path,
+        range: TrimRange,
+        artifact_path: &Path,
+        source_size: u64,
+        source_modified: i64,
+    ) -> io::Result<()> {
+        block_on(async {
+            sqlx::query(
+                "INSERT INTO trims(
+                    source_path, start_ratio, end_ratio, artifact_path, source_size,
+                    source_modified, artifact_start_ratio, artifact_end_ratio
+                 ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+                 ON CONFLICT(source_path) DO UPDATE SET
+                    start_ratio = excluded.start_ratio,
+                    end_ratio = excluded.end_ratio,
+                    artifact_path = excluded.artifact_path",
+            )
+            .bind(source_path.to_string_lossy().as_ref())
+            .bind(range.start_ratio as f64)
+            .bind(range.end_ratio as f64)
+            .bind(artifact_path.to_string_lossy().as_ref())
+            .bind(source_size as i64)
+            .bind(source_modified)
+            .execute(&self.pool)
+            .await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
+    pub(crate) fn mark_trim_artifact_ready(
+        &self,
+        source_path: &Path,
+        range: TrimRange,
+        source_size: u64,
+        source_modified: i64,
+    ) -> io::Result<bool> {
+        let updated = block_on(async {
+            sqlx::query(
+                "UPDATE trims SET
+                    source_size = ?, source_modified = ?,
+                    artifact_start_ratio = ?, artifact_end_ratio = ?
+                 WHERE source_path = ? AND start_ratio = ? AND end_ratio = ?",
+            )
+            .bind(source_size as i64)
+            .bind(source_modified)
+            .bind(range.start_ratio as f64)
+            .bind(range.end_ratio as f64)
+            .bind(source_path.to_string_lossy().as_ref())
+            .bind(range.start_ratio as f64)
+            .bind(range.end_ratio as f64)
+            .execute(&self.pool)
+            .await
+        })
+        .map_err(io::Error::other)?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    pub(crate) fn clear_trims(&self, paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let mut artifacts = BTreeSet::new();
+            for path in paths {
+                if let Some(row) =
+                    sqlx::query("SELECT artifact_path FROM trims WHERE source_path = ?")
+                        .bind(path.to_string_lossy().as_ref())
+                        .fetch_optional(&mut *tx)
+                        .await?
+                {
+                    artifacts.insert(PathBuf::from(row.get::<String, _>("artifact_path")));
+                }
+                sqlx::query("DELETE FROM trims WHERE source_path = ?")
+                    .bind(path.to_string_lossy().as_ref())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(artifacts.into_iter().collect())
+        })
+        .map_err(io::Error::other)
+    }
+
+    pub(crate) fn transfer_trim(
+        &self,
+        source: &Path,
+        destination: &Path,
+        artifact_path: &Path,
+        size: u64,
+        modified: i64,
+    ) -> io::Result<bool> {
+        let updated = block_on(async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("DELETE FROM trims WHERE source_path = ?")
+                .bind(destination.to_string_lossy().as_ref())
+                .execute(&mut *tx)
+                .await?;
+            let updated = sqlx::query(
+                "UPDATE trims SET source_path = ?, artifact_path = ?, source_size = ?, source_modified = ?
+                 WHERE source_path = ?",
+            )
+            .bind(destination.to_string_lossy().as_ref())
+            .bind(artifact_path.to_string_lossy().as_ref())
+            .bind(size as i64)
+            .bind(modified)
+            .bind(source.to_string_lossy().as_ref())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(updated)
+        })
+        .map_err(io::Error::other)?;
+        Ok(updated == 1)
+    }
+
+    pub(crate) fn copy_trim(
+        &self,
+        source: &Path,
+        destination: &Path,
+        artifact_path: &Path,
+        size: u64,
+        modified: i64,
+    ) -> io::Result<bool> {
+        let Some(trim) = self.trim_for_path(source)? else {
+            return Ok(false);
+        };
+        self.set_trim(destination, trim.range, artifact_path, size, modified)?;
+        Ok(true)
+    }
+
+    pub(crate) fn trim_inheritance_candidates(
+        &self,
+        category: Category,
+    ) -> io::Result<Vec<TrimInheritanceCandidate>> {
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT f.path, f.size, f.modified, sibling_trim.start_ratio, sibling_trim.end_ratio
+                 FROM files f
+                 JOIN files sibling
+                   ON sibling.category = f.category AND sibling.stem = f.stem AND sibling.path != f.path
+                 JOIN trims sibling_trim ON sibling_trim.source_path = sibling.path
+                 LEFT JOIN trims own_trim ON own_trim.source_path = f.path
+                 WHERE f.category = ? AND own_trim.source_path IS NULL
+                 GROUP BY f.path
+                 HAVING MIN(sibling_trim.start_ratio) = MAX(sibling_trim.start_ratio)
+                    AND MIN(sibling_trim.end_ratio) = MAX(sibling_trim.end_ratio)
+                 ORDER BY f.path",
+            )
+            .bind(category_key(category))
+            .fetch_all(&self.pool)
+            .await
+        })
+        .map_err(io::Error::other)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(TrimInheritanceCandidate {
+                    source_path: PathBuf::from(row.get::<String, _>("path")),
+                    size: row.get::<i64, _>("size") as u64,
+                    modified: row.get("modified"),
+                    range: TrimRange::new(
+                        row.get::<f64, _>("start_ratio") as f32,
+                        row.get::<f64, _>("end_ratio") as f32,
+                    )?,
+                })
+            })
+            .collect())
+    }
+
+    pub(crate) fn remove_orphan_trims(&self) -> io::Result<Vec<PathBuf>> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let rows = sqlx::query(
+                "SELECT artifact_path FROM trims
+                 WHERE NOT EXISTS (SELECT 1 FROM files WHERE files.path = trims.source_path)",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM trims
+                 WHERE NOT EXISTS (SELECT 1 FROM files WHERE files.path = trims.source_path)",
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(
+                rows.into_iter()
+                    .map(|row| PathBuf::from(row.get::<String, _>("artifact_path")))
+                    .collect(),
+            )
+        })
+        .map_err(io::Error::other)
+    }
+
     #[cfg(test)]
     pub fn clear_preview_waveform(&self, path: &Path) -> io::Result<()> {
         block_on(async {
@@ -530,26 +771,22 @@ impl Database {
     }
 
     fn file_rows(&self, category: Category) -> io::Result<Vec<sqlx::sqlite::SqliteRow>> {
-        let files = Alias::new("files");
-        let mut query = Query::select();
-        query
-            .columns([
-                Alias::new("path"),
-                Alias::new("stem"),
-                Alias::new("extension"),
-                Alias::new("size"),
-                Alias::new("modified"),
-                Alias::new("first_seen_at"),
-                Alias::new("preview_waveform"),
-            ])
-            .from(files)
-            .and_where(Expr::col(Alias::new("category")).eq(category_key(category)));
-        query
-            .order_by(Alias::new("stem"), sea_query::Order::Asc)
-            .order_by(Alias::new("extension"), sea_query::Order::Asc);
-
-        let sql = query.to_string(SqliteQueryBuilder);
-        block_on(async { sqlx::query(&sql).fetch_all(&self.pool).await }).map_err(io::Error::other)
+        block_on(async {
+            sqlx::query(
+                "SELECT f.path, f.stem, f.extension, f.size, f.modified, f.first_seen_at,
+                        f.preview_waveform, t.start_ratio, t.end_ratio, t.artifact_path,
+                        t.source_size, t.source_modified, t.artifact_start_ratio,
+                        t.artifact_end_ratio
+                 FROM files f
+                 LEFT JOIN trims t ON t.source_path = f.path
+                 WHERE f.category = ?
+                 ORDER BY f.stem, f.extension",
+            )
+            .bind(category_key(category))
+            .fetch_all(&self.pool)
+            .await
+        })
+        .map_err(io::Error::other)
     }
 
     fn matching_stems(
@@ -637,9 +874,14 @@ impl Database {
         for chunk in stems.chunks(500) {
             let placeholders = placeholders(chunk.len());
             let sql = format!(
-                "SELECT path, stem, extension, size, modified, first_seen_at, preview_waveform FROM files
-                 WHERE category = ? AND stem IN ({placeholders})
-                 ORDER BY stem, extension"
+                "SELECT f.path, f.stem, f.extension, f.size, f.modified, f.first_seen_at,
+                        f.preview_waveform, t.start_ratio, t.end_ratio, t.artifact_path,
+                        t.source_size, t.source_modified, t.artifact_start_ratio,
+                        t.artifact_end_ratio
+                 FROM files f
+                 LEFT JOIN trims t ON t.source_path = f.path
+                 WHERE f.category = ? AND f.stem IN ({placeholders})
+                 ORDER BY f.stem, f.extension"
             );
             let chunk_rows = block_on(async {
                 let mut query = sqlx::query(&sql).bind(category_key(category));
@@ -780,6 +1022,15 @@ fn current_unix_millis() -> i64 {
         .unwrap_or_default()
 }
 
+fn metadata_modified_secs(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 fn sort_variants(variants: &mut [FileVariant], priority: &[AudioFormat]) {
     variants.sort_by(|a, b| {
         priority_index(&a.extension, priority)
@@ -790,20 +1041,103 @@ fn sort_variants(variants: &mut [FileVariant], priority: &[AudioFormat]) {
 }
 
 fn file_row_from_sql(row: sqlx::sqlite::SqliteRow) -> FileRow {
+    let path = PathBuf::from(row.get::<String, _>("path"));
     let preview_waveform = row
         .try_get::<Option<Vec<u8>>, _>("preview_waveform")
         .ok()
         .flatten()
         .and_then(|bytes| bytes.try_into().ok());
+    let trim = row
+        .try_get::<Option<f64>, _>("start_ratio")
+        .ok()
+        .flatten()
+        .zip(row.try_get::<Option<f64>, _>("end_ratio").ok().flatten())
+        .and_then(|(start, end)| TrimRange::new(start as f32, end as f32));
+    let trim_artifact_path = row
+        .try_get::<Option<String>, _>("artifact_path")
+        .ok()
+        .flatten()
+        .map(PathBuf::from);
+    let artifact_range = row
+        .try_get::<Option<f64>, _>("artifact_start_ratio")
+        .ok()
+        .flatten()
+        .zip(
+            row.try_get::<Option<f64>, _>("artifact_end_ratio")
+                .ok()
+                .flatten(),
+        )
+        .and_then(|(start, end)| TrimRange::new(start as f32, end as f32));
+    let trim_artifact_state = trim.map(|range| {
+        if trim_artifact_path
+            .as_ref()
+            .is_none_or(|path| !path.is_file())
+        {
+            return TrimArtifactState::Missing;
+        }
+        let stored_fingerprint = row
+            .try_get::<Option<i64>, _>("source_size")
+            .ok()
+            .flatten()
+            .zip(
+                row.try_get::<Option<i64>, _>("source_modified")
+                    .ok()
+                    .flatten(),
+            )
+            .map(|(size, modified)| (size as u64, modified));
+        let current_fingerprint = fs::metadata(&path)
+            .ok()
+            .map(|metadata| (metadata.len(), metadata_modified_secs(&metadata)))
+            .unwrap_or_else(|| {
+                (
+                    row.get::<i64, _>("size") as u64,
+                    row.get::<i64, _>("modified"),
+                )
+            });
+        let fingerprint_matches = stored_fingerprint == Some(current_fingerprint);
+        if artifact_range == Some(range) && fingerprint_matches {
+            TrimArtifactState::Ready
+        } else {
+            TrimArtifactState::Stale
+        }
+    });
     FileRow {
-        path: PathBuf::from(row.get::<String, _>("path")),
+        path,
         stem: row.get("stem"),
         extension: row.get("extension"),
         size: row.get::<i64, _>("size") as u64,
         modified: row.get("modified"),
         first_seen_at: row.get("first_seen_at"),
         preview_waveform,
+        trim,
+        trim_artifact_path,
+        trim_artifact_state,
     }
+}
+
+fn trim_record_from_sql(row: sqlx::sqlite::SqliteRow) -> Option<TrimRecord> {
+    let range = TrimRange::new(
+        row.get::<f64, _>("start_ratio") as f32,
+        row.get::<f64, _>("end_ratio") as f32,
+    )?;
+    let artifact_range = row
+        .try_get::<Option<f64>, _>("artifact_start_ratio")
+        .ok()
+        .flatten()
+        .zip(
+            row.try_get::<Option<f64>, _>("artifact_end_ratio")
+                .ok()
+                .flatten(),
+        )
+        .and_then(|(start, end)| TrimRange::new(start as f32, end as f32));
+    Some(TrimRecord {
+        source_path: PathBuf::from(row.get::<String, _>("source_path")),
+        range,
+        artifact_path: PathBuf::from(row.get::<String, _>("artifact_path")),
+        source_size: row.get::<i64, _>("source_size") as u64,
+        source_modified: row.get("source_modified"),
+        artifact_range,
+    })
 }
 
 fn display_names_for_rows(

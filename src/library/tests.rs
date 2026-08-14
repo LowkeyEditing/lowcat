@@ -1,14 +1,23 @@
 use super::*;
 use std::fs;
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_path(name: &str) -> PathBuf {
+    static NEXT_UNIQUE_PATH: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("lowcat-{name}-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "lowcat-{name}-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT_UNIQUE_PATH.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn category_dir(name: &str) -> PathBuf {
@@ -59,6 +68,141 @@ fn fixture(dir: &Path, name: &str, tags: &[(&str, &str)]) -> PathBuf {
         path.display()
     );
     path
+}
+
+#[gpui::test]
+fn external_row_format_and_multi_drags_use_ready_trim_artifacts(cx: &mut gpui::TestAppContext) {
+    let settings_path = settings_path("trim-drag-ready");
+    let (music_dir, _) = settings_with_folders(&settings_path);
+    fixture(&music_dir, "group.wav", &[]);
+    fixture(&music_dir, "group.mp3", &[]);
+    fixture(&music_dir, "other.wav", &[]);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+    let (originals, artifacts) = library.update(cx, |lib, _| {
+        let records = lib.active_state().all_records.as_ref().clone();
+        let range = TrimRange::new(0.1, 0.9).unwrap();
+        let mut originals = Vec::new();
+        let mut artifacts = Vec::new();
+        let mut token = 1;
+        for record in records {
+            let requests = lib.backend.set_trim_range(&record.variants, range).unwrap();
+            for request in requests {
+                let gate = Arc::new(Mutex::new(token));
+                assert_eq!(
+                    lib.backend
+                        .generate_trim_artifact(&request, &gate, token)
+                        .unwrap(),
+                    TrimGenerationOutcome::Published
+                );
+                originals.push(request.source_path);
+                artifacts.push(request.artifact_path);
+                token += 1;
+            }
+        }
+        lib.refresh_category_state(Category::Music);
+        (originals, artifacts)
+    });
+
+    library.read_with(cx, |lib, _| {
+        assert_eq!(lib.external_drag_paths(&originals).unwrap(), artifacts);
+        for original in &originals {
+            let resolved = lib
+                .external_drag_paths(std::slice::from_ref(original))
+                .unwrap();
+            assert_ne!(resolved[0], *original);
+        }
+    });
+
+    library.update(cx, |lib, cx| {
+        lib.begin_internal_file_drag_files(originals.clone(), cx);
+        assert_eq!(
+            lib.internal_file_drag.as_ref().unwrap().paths,
+            originals
+                .iter()
+                .cloned()
+                .map(canonical_or_original)
+                .collect::<Vec<_>>(),
+            "internal category drops retain source paths"
+        );
+    });
+}
+
+#[gpui::test]
+fn pending_trim_blocks_external_drag_instead_of_exporting_original(cx: &mut gpui::TestAppContext) {
+    let settings_path = settings_path("trim-drag-blocked");
+    let (music_dir, _) = settings_with_folders(&settings_path);
+    let source = fixture(&music_dir, "pending.wav", &[]);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+    library.update(cx, |lib, _| {
+        let variant = lib.active_state().all_records[0].variants[0].clone();
+        lib.backend
+            .set_trim_range(
+                std::slice::from_ref(&variant),
+                TrimRange::new(0.2, 0.8).unwrap(),
+            )
+            .unwrap();
+        lib.refresh_category_state(Category::Music);
+    });
+    assert_eq!(
+        library.read_with(cx, |lib, _| lib
+            .external_drag_paths(std::slice::from_ref(&source))),
+        Err(TrimArtifactState::Missing)
+    );
+
+    library.update(cx, |lib, _| {
+        lib.trim_generations.insert(
+            source.clone(),
+            TrimGeneration {
+                token: 1,
+                gate: Arc::new(Mutex::new(1)),
+                state: TrimArtifactState::Failed,
+            },
+        );
+    });
+    assert_eq!(
+        library.read_with(cx, |lib, _| lib.external_drag_paths(&[source])),
+        Err(TrimArtifactState::Failed)
+    );
+}
+
+#[gpui::test]
+fn trim_cancellation_removes_all_row_metadata_and_artifacts(cx: &mut gpui::TestAppContext) {
+    let settings_path = settings_path("trim-cancel");
+    let (music_dir, _) = settings_with_folders(&settings_path);
+    fixture(&music_dir, "cancel.wav", &[]);
+    fixture(&music_dir, "cancel.mp3", &[]);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+    let (row_path, artifacts) = library.update(cx, |lib, _| {
+        let record = lib.active_state().results[0].clone();
+        let requests = lib
+            .backend
+            .set_trim_range(&record.variants, TrimRange::new(0.2, 0.8).unwrap())
+            .unwrap();
+        let artifacts = requests
+            .into_iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let token = index as u64 + 1;
+                lib.backend
+                    .generate_trim_artifact(&request, &Arc::new(Mutex::new(token)), token)
+                    .unwrap();
+                request.artifact_path
+            })
+            .collect::<Vec<_>>();
+        lib.refresh_category_state(Category::Music);
+        (record.path, artifacts)
+    });
+    library.update(cx, |lib, cx| lib.cancel_trim(&row_path, cx));
+
+    library.read_with(cx, |lib, _| {
+        let record = &lib.active_state().results[0];
+        assert_eq!(record.effective_row_trim(), None);
+        assert!(record.variants.iter().all(|variant| variant.trim.is_none()));
+    });
+    assert!(artifacts.iter().all(|artifact| !artifact.exists()));
 }
 
 #[gpui::test]
@@ -523,6 +667,19 @@ fn cross_category_internal_drop_moves_file(cx: &mut gpui::TestAppContext) {
             .add_tag(Category::Music, &music_file, "CUSTOM", "Favorite")
             .unwrap();
         lib.refresh_category_state(Category::Music);
+        let variant = lib.states[&Category::Music].results[0].variants[0].clone();
+        let request = lib
+            .backend
+            .set_trim_range(
+                std::slice::from_ref(&variant),
+                TrimRange::new(0.2, 0.8).unwrap(),
+            )
+            .unwrap()
+            .remove(0);
+        lib.backend
+            .generate_trim_artifact(&request, &Arc::new(Mutex::new(1)), 1)
+            .unwrap();
+        lib.refresh_category_state(Category::Music);
     });
 
     library.update(cx, |lib, cx| {
@@ -535,17 +692,23 @@ fn cross_category_internal_drop_moves_file(cx: &mut gpui::TestAppContext) {
 
     assert!(!music_file.exists());
     assert!(sfx_dir.join("move.flac").is_file());
-    let (music_count, sfx_count, sfx_tags) = library.read_with(cx, |lib, _| {
-        (
-            lib.states[&Category::Music].results.len(),
-            lib.states[&Category::Sfx].results.len(),
-            lib.states[&Category::Sfx].results[0].tags.clone(),
-        )
-    });
+    let (music_count, sfx_count, sfx_tags, sfx_trim, sfx_trim_state) =
+        library.read_with(cx, |lib, _| {
+            let variant = &lib.states[&Category::Sfx].results[0].variants[0];
+            (
+                lib.states[&Category::Music].results.len(),
+                lib.states[&Category::Sfx].results.len(),
+                lib.states[&Category::Sfx].results[0].tags.clone(),
+                variant.trim,
+                variant.trim_artifact_state,
+            )
+        });
     assert_eq!(music_count, 0);
     assert_eq!(sfx_count, 1);
     assert_eq!(sfx_tags["genre"], vec!["Ambient"]);
     assert_eq!(sfx_tags["custom"], vec!["Favorite"]);
+    assert_eq!(sfx_trim, TrimRange::new(0.2, 0.8));
+    assert_eq!(sfx_trim_state, Some(TrimArtifactState::Ready));
 }
 
 #[gpui::test]

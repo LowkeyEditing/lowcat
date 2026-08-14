@@ -1,20 +1,28 @@
 use super::*;
 use std::fs::File;
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lofty::config::ParseOptions;
 use lofty::file::AudioFile;
 use lofty::flac::FlacFile;
 
+use crate::model::{TrimArtifactState, TrimRange};
+
 fn unique_dir(name: &str) -> PathBuf {
+    static NEXT_UNIQUE_DIR: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "lowcat-backend-{name}-{}-{nanos}",
-        std::process::id()
+        "lowcat-backend-{name}-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT_UNIQUE_DIR.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&path).unwrap();
     path
@@ -56,6 +64,170 @@ fn fixture(dir: &Path, name: &str, tags: &[(&str, &str)]) -> PathBuf {
         path.display()
     );
     path
+}
+
+fn duration_fixture(dir: &Path, name: &str, duration: f64) -> PathBuf {
+    let path = dir.join(name);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            &duration.to_string(),
+            "-y",
+        ])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    path
+}
+
+fn probed_duration(path: &Path) -> f64 {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn trim_generation_is_accurate_nondestructive_and_atomically_replaced() {
+    let dir = unique_dir("trim-generation");
+    let source = duration_fixture(&dir, "tone.wav", 1.0);
+    let original = fs::read(&source).unwrap();
+    let mut backend = backend("trim-generation");
+    backend
+        .set_category_folder(Category::Music, dir.clone())
+        .unwrap();
+    let variant = backend.filter(Category::Music, "", &BTreeMap::new())[0].variants[0].clone();
+
+    let first_range = TrimRange::new(0.1, 0.4).unwrap();
+    let first = backend
+        .set_trim_range(std::slice::from_ref(&variant), first_range)
+        .unwrap()
+        .remove(0);
+    let gate = Arc::new(Mutex::new(1));
+    assert_eq!(
+        backend.generate_trim_artifact(&first, &gate, 1).unwrap(),
+        TrimGenerationOutcome::Published
+    );
+    assert!((probed_duration(&first.artifact_path) - 0.3).abs() < 0.03);
+    assert_eq!(fs::read(&source).unwrap(), original);
+    let first_bytes = fs::read(&first.artifact_path).unwrap();
+
+    let second_range = TrimRange::new(0.15, 0.85).unwrap();
+    let second = backend
+        .set_trim_range(std::slice::from_ref(&variant), second_range)
+        .unwrap()
+        .remove(0);
+    assert_eq!(first.artifact_path, second.artifact_path);
+    *gate.lock().unwrap() = 2;
+    assert_eq!(
+        backend.generate_trim_artifact(&second, &gate, 2).unwrap(),
+        TrimGenerationOutcome::Published
+    );
+    assert!((probed_duration(&second.artifact_path) - 0.7).abs() < 0.03);
+    assert_ne!(fs::read(&second.artifact_path).unwrap(), first_bytes);
+    assert_eq!(fs::read(&source).unwrap(), original);
+}
+
+#[test]
+fn superseded_trim_job_cannot_publish() {
+    let dir = unique_dir("trim-superseded");
+    duration_fixture(&dir, "tone.wav", 0.25);
+    let mut backend = backend("trim-superseded");
+    backend.set_category_folder(Category::Music, dir).unwrap();
+    let variant = backend.filter(Category::Music, "", &BTreeMap::new())[0].variants[0].clone();
+    let old = backend
+        .set_trim_range(
+            std::slice::from_ref(&variant),
+            TrimRange::new(0.1, 0.5).unwrap(),
+        )
+        .unwrap()
+        .remove(0);
+    let current = backend
+        .set_trim_range(
+            std::slice::from_ref(&variant),
+            TrimRange::new(0.3, 0.9).unwrap(),
+        )
+        .unwrap()
+        .remove(0);
+    let gate = Arc::new(Mutex::new(2));
+
+    assert_eq!(
+        backend.generate_trim_artifact(&old, &gate, 1).unwrap(),
+        TrimGenerationOutcome::Superseded
+    );
+    assert!(!old.artifact_path.exists());
+    assert_eq!(
+        backend.generate_trim_artifact(&current, &gate, 2).unwrap(),
+        TrimGenerationOutcome::Published
+    );
+    assert!(current.artifact_path.is_file());
+}
+
+#[test]
+fn rename_preserves_ready_trim_and_new_variant_inherits_range() {
+    let dir = unique_dir("trim-lifecycle");
+    duration_fixture(&dir, "song.wav", 0.2);
+    let mut backend = backend("trim-lifecycle");
+    backend
+        .set_category_folder(Category::Music, dir.clone())
+        .unwrap();
+    let record = backend.filter(Category::Music, "", &BTreeMap::new())[0].clone();
+    let range = TrimRange::new(0.2, 0.8).unwrap();
+    let request = backend
+        .set_trim_range(&record.variants, range)
+        .unwrap()
+        .remove(0);
+    let gate = Arc::new(Mutex::new(1));
+    backend.generate_trim_artifact(&request, &gate, 1).unwrap();
+
+    backend
+        .rename_records(
+            Category::Music,
+            &[RenameRecord {
+                stem: "song".to_string(),
+                paths: vec![record.path],
+            }],
+            "renamed",
+        )
+        .unwrap();
+    let renamed = backend.filter(Category::Music, "", &BTreeMap::new());
+    assert_eq!(renamed[0].name, "renamed");
+    assert_eq!(renamed[0].effective_row_trim(), Some(range));
+    assert_eq!(
+        renamed[0].variants[0].trim_artifact_state,
+        Some(TrimArtifactState::Ready)
+    );
+
+    duration_fixture(&dir, "renamed.mp3", 0.2);
+    backend.refresh_category(Category::Music).unwrap();
+    let with_variant = backend.filter(Category::Music, "", &BTreeMap::new());
+    let mp3 = with_variant[0].variant_for_extension("mp3").unwrap();
+    assert_eq!(mp3.trim, Some(range));
+    assert_eq!(mp3.trim_artifact_state, Some(TrimArtifactState::Missing));
 }
 
 fn names(records: Vec<FileRecord>) -> Vec<String> {

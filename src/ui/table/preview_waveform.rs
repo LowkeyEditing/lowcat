@@ -5,6 +5,7 @@ struct PreviewWaveformElement {
     table: Entity<FileTable>,
     path: PathBuf,
     waveform: Option<WaveformBinary256>,
+    trim: Option<TrimRange>,
     playhead_bits: Arc<AtomicU32>,
 }
 
@@ -13,6 +14,7 @@ pub(super) fn element(
     table: Entity<FileTable>,
     path: PathBuf,
     waveform: Option<WaveformBinary256>,
+    trim: Option<TrimRange>,
     playhead_bits: Arc<AtomicU32>,
 ) -> impl IntoElement {
     PreviewWaveformElement {
@@ -20,15 +22,22 @@ pub(super) fn element(
         table,
         path,
         waveform,
+        trim,
         playhead_bits,
     }
 }
 
 #[derive(Clone, Copy)]
 enum PreviewScrubAction {
-    Begin,
+    Begin(Option<TrimEdge>),
     Continue,
     End,
+}
+
+struct PreviewHitboxes {
+    surface: Hitbox,
+    start_edge: Option<Hitbox>,
+    end_edge: Option<Hitbox>,
 }
 
 impl IntoElement for PreviewWaveformElement {
@@ -41,7 +50,7 @@ impl IntoElement for PreviewWaveformElement {
 
 impl Element for PreviewWaveformElement {
     type RequestLayoutState = ();
-    type PrepaintState = Hitbox;
+    type PrepaintState = PreviewHitboxes;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -80,7 +89,28 @@ impl Element for PreviewWaveformElement {
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+        let surface = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let (start_edge, end_edge) = self.trim.map_or((None, None), |trim| {
+            let width = bounds.size.width.as_f32().max(1.);
+            let edge_bounds = |ratio: f32| {
+                Bounds::new(
+                    point(
+                        px(bounds.left().as_f32() + width * ratio - 3.),
+                        bounds.top(),
+                    ),
+                    size(px(6.), bounds.size.height),
+                )
+            };
+            (
+                Some(window.insert_hitbox(edge_bounds(trim.start_ratio), HitboxBehavior::Normal)),
+                Some(window.insert_hitbox(edge_bounds(trim.end_ratio), HitboxBehavior::Normal)),
+            )
+        });
+        PreviewHitboxes {
+            surface,
+            start_edge,
+            end_edge,
+        }
     }
 
     fn paint(
@@ -96,16 +126,26 @@ impl Element for PreviewWaveformElement {
         paint_preview_waveform(
             bounds,
             self.waveform,
+            self.trim,
             FileTable::load_preview_playhead(&self.playhead_bits),
             window,
         );
-        let hitbox = prepaint.clone();
+        let hitbox = prepaint.surface.clone();
         window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+        if let Some(handle) = prepaint.start_edge.as_ref() {
+            window.set_cursor_style(CursorStyle::ResizeLeftRight, handle);
+        }
+        if let Some(handle) = prepaint.end_edge.as_ref() {
+            window.set_cursor_style(CursorStyle::ResizeLeftRight, handle);
+        }
 
         window.on_mouse_event({
             let table = self.table.clone();
             let path = self.path.clone();
             let hitbox = hitbox.clone();
+            let start_edge = prepaint.start_edge.clone();
+            let end_edge = prepaint.end_edge.clone();
+            let trim = self.trim;
             move |event: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble
                     || event.button != MouseButton::Left
@@ -114,12 +154,34 @@ impl Element for PreviewWaveformElement {
                 {
                     return;
                 }
+                if event.click_count == 2 {
+                    cx.update_entity(&table, |table, cx| {
+                        table.cancel_preview_trim(&path, cx);
+                    });
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
+                let edge = if start_edge
+                    .as_ref()
+                    .is_some_and(|handle| handle.is_hovered(window))
+                {
+                    Some(TrimEdge::Start)
+                } else if end_edge
+                    .as_ref()
+                    .is_some_and(|handle| handle.is_hovered(window))
+                {
+                    Some(TrimEdge::End)
+                } else {
+                    None
+                };
                 scrub_preview_from_position(
                     &table,
                     &path,
                     event.position,
                     bounds,
-                    PreviewScrubAction::Begin,
+                    PreviewScrubAction::Begin(edge),
+                    trim,
                     cx,
                 );
                 cx.stop_propagation();
@@ -141,6 +203,7 @@ impl Element for PreviewWaveformElement {
                     event.position,
                     bounds,
                     PreviewScrubAction::Continue,
+                    None,
                     cx,
                 );
                 cx.stop_propagation();
@@ -151,7 +214,7 @@ impl Element for PreviewWaveformElement {
             let table = self.table.clone();
             let path = self.path.clone();
             move |event: &MouseUpEvent, phase, _, cx| {
-                if phase != DispatchPhase::Bubble {
+                if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
                     return;
                 }
                 scrub_preview_from_position(
@@ -160,8 +223,10 @@ impl Element for PreviewWaveformElement {
                     event.position,
                     bounds,
                     PreviewScrubAction::End,
+                    None,
                     cx,
                 );
+                cx.stop_propagation();
             }
         });
     }
@@ -170,11 +235,25 @@ impl Element for PreviewWaveformElement {
 fn paint_preview_waveform(
     bounds: Bounds<Pixels>,
     waveform: Option<WaveformBinary256>,
+    trim: Option<TrimRange>,
     playhead_ratio: Option<f32>,
     window: &mut Window,
 ) {
     let row_width = bounds.size.width.as_f32().max(1.);
     let color = white();
+    let trim_color = hsla(0.085, 0.9, 0.72, 1.);
+
+    if let Some(trim) = trim {
+        let x = bounds.left().as_f32() + row_width * trim.start_ratio;
+        let width = row_width * (trim.end_ratio - trim.start_ratio);
+        window.paint_quad(fill(
+            Bounds::new(
+                point(px(x), bounds.top()),
+                size(px(width), bounds.size.height),
+            ),
+            trim_color.opacity(0.14),
+        ));
+    }
 
     if let Some(waveform) = waveform {
         let row_height = bounds.size.height.as_f32().max(1.);
@@ -191,9 +270,29 @@ fn paint_preview_waveform(
             };
             let x = bounds.left().as_f32() + ix as f32 * (bar_width + bar_gap);
             let y = bounds.bottom().as_f32() - height;
+            let ratio = (ix as f32 + 0.5) / WAVEFORM_BAR_COUNT as f32;
+            let bar_color =
+                if trim.is_some_and(|trim| ratio >= trim.start_ratio && ratio <= trim.end_ratio) {
+                    trim_color
+                } else {
+                    color
+                };
             window.paint_quad(fill(
                 Bounds::new(point(px(x), px(y)), size(px(bar_width), px(height))),
-                color,
+                bar_color,
+            ));
+        }
+    }
+
+    if let Some(trim) = trim {
+        for ratio in [trim.start_ratio, trim.end_ratio] {
+            let x = bounds.left().as_f32() + row_width * ratio;
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(px(x - 1.), bounds.top()),
+                    size(px(2.), bounds.size.height),
+                ),
+                trim_color,
             ));
         }
     }
@@ -213,19 +312,21 @@ fn scrub_preview_from_position(
     position: Point<Pixels>,
     bounds: Bounds<Pixels>,
     action: PreviewScrubAction,
+    persisted: Option<TrimRange>,
     cx: &mut App,
 ) {
-    let ratio = ((position.x.as_f32() - bounds.left().as_f32())
-        / bounds.size.width.as_f32().max(1.))
-    .clamp(0., 1.);
+    let x = position.x.as_f32() - bounds.left().as_f32();
+    let width = bounds.size.width.as_f32().max(1.);
+    let ratio = (x / width).clamp(0., 1.);
     cx.update_entity(table, |table, cx| match action {
-        PreviewScrubAction::Begin => {
-            table.begin_preview_scrub(path.to_path_buf(), ratio, cx);
+        PreviewScrubAction::Begin(edge) => {
+            table.begin_preview_scrub(path.to_path_buf(), ratio, x, width, edge, persisted, cx);
         }
         PreviewScrubAction::Continue => {
-            table.continue_preview_scrub(path, ratio, cx);
+            table.continue_preview_scrub(path, ratio, x, cx);
         }
         PreviewScrubAction::End => {
+            table.continue_preview_scrub(path, ratio, x, cx);
             table.end_preview_scrub(path, cx);
         }
     });

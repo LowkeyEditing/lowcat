@@ -10,3 +10,6 @@ target/
 *.pdb
 
 .claude
+_bmad
+_bmad-output
+.agents

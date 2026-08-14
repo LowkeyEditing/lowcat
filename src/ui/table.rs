@@ -25,7 +25,7 @@ use gpui::{
     point, prelude::FluentBuilder as _, px, red, relative, size, white,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable, StyledExt, VirtualListScrollHandle,
+    ActiveTheme as _, Icon, IconName, Sizable, StyledExt, VirtualListScrollHandle, WindowExt as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
@@ -39,7 +39,10 @@ use crate::ui::titlebar::{TITLEBAR_HEIGHT, TITLEBAR_LEFT_OFFSET};
 use crate::{
     backend::RenameRecord,
     library::{Library, LibraryEvent},
-    model::{AudioFormat, Category, FileRecord, WAVEFORM_BAR_COUNT, WaveformBinary256},
+    model::{
+        AudioFormat, Category, FileRecord, TrimArtifactState, TrimRange, WAVEFORM_BAR_COUNT,
+        WaveformBinary256,
+    },
 };
 
 const TAG_CELL_LEFT_PADDING_WIDTH: f32 = 12.;
@@ -53,6 +56,7 @@ const TAG_KEY_ACTION_WIDTH: f32 = 32.;
 const TAG_KEY_EDITOR_WIDTH: f32 = 118.;
 const CONVERT_MENU_PANE_WIDTH: f32 = 160.;
 const ROW_HEIGHT: Pixels = px(32.);
+const TRIM_DRAG_THRESHOLD_PX: f32 = 4.;
 
 #[derive(Clone)]
 pub(super) struct InternalFileDrag {
@@ -302,35 +306,200 @@ enum ColumnVisibilityHover {
     ToggleAll,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrimEdge {
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PreviewPointerMode {
+    PendingClick {
+        press_x: f32,
+        anchor_ratio: f32,
+        current_ratio: f32,
+    },
+    NewSelection {
+        anchor_ratio: f32,
+        current_ratio: f32,
+    },
+    AdjustStart {
+        original: TrimRange,
+        current: TrimRange,
+    },
+    AdjustEnd {
+        original: TrimRange,
+        current: TrimRange,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct PreviewScrub {
     path: PathBuf,
-    ratio: f32,
+    width: f32,
+    mode: PreviewPointerMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PreviewPointerRelease {
+    Seek(f32),
+    Commit(TrimRange),
+    Unchanged,
 }
 
 impl PreviewScrub {
-    fn new(path: PathBuf, ratio: f32) -> Self {
+    fn new(
+        path: PathBuf,
+        ratio: f32,
+        x: f32,
+        width: f32,
+        edge: Option<TrimEdge>,
+        persisted: Option<TrimRange>,
+    ) -> Self {
+        let ratio = ratio.clamp(0., 1.);
+        let mode = match (edge, persisted) {
+            (Some(TrimEdge::Start), Some(original)) => PreviewPointerMode::AdjustStart {
+                original,
+                current: original,
+            },
+            (Some(TrimEdge::End), Some(original)) => PreviewPointerMode::AdjustEnd {
+                original,
+                current: original,
+            },
+            _ => PreviewPointerMode::PendingClick {
+                press_x: x,
+                anchor_ratio: ratio,
+                current_ratio: ratio,
+            },
+        };
         Self {
             path,
-            ratio: ratio.clamp(0., 1.),
+            width: width.max(1.),
+            mode,
         }
     }
 
-    fn update(&mut self, path: &Path, ratio: f32) -> bool {
+    fn update(&mut self, path: &Path, ratio: f32, x: f32) -> bool {
         if self.path != path {
             return false;
         }
-        self.ratio = ratio.clamp(0., 1.);
-        true
+        let ratio = ratio.clamp(0., 1.);
+        let previous = self.mode;
+        self.mode = match self.mode {
+            PreviewPointerMode::PendingClick {
+                press_x,
+                anchor_ratio,
+                ..
+            } if (x - press_x).abs() >= TRIM_DRAG_THRESHOLD_PX => {
+                PreviewPointerMode::NewSelection {
+                    anchor_ratio,
+                    current_ratio: ratio,
+                }
+            }
+            PreviewPointerMode::PendingClick {
+                press_x,
+                anchor_ratio,
+                ..
+            } => PreviewPointerMode::PendingClick {
+                press_x,
+                anchor_ratio,
+                current_ratio: ratio,
+            },
+            PreviewPointerMode::NewSelection { anchor_ratio, .. } => {
+                PreviewPointerMode::NewSelection {
+                    anchor_ratio,
+                    current_ratio: ratio,
+                }
+            }
+            PreviewPointerMode::AdjustStart { original, .. } => PreviewPointerMode::AdjustStart {
+                original,
+                current: adjust_trim_edge(original, TrimEdge::Start, ratio, self.width),
+            },
+            PreviewPointerMode::AdjustEnd { original, .. } => PreviewPointerMode::AdjustEnd {
+                original,
+                current: adjust_trim_edge(original, TrimEdge::End, ratio, self.width),
+            },
+        };
+        self.mode != previous
     }
 
-    fn take_ratio_for_path(scrub: &mut Option<Self>, path: &Path) -> Option<f32> {
-        if scrub.as_ref().is_some_and(|scrub| scrub.path == path) {
-            scrub.take().map(|scrub| scrub.ratio)
-        } else {
-            None
+    fn provisional_trim(&self) -> Option<TrimRange> {
+        match self.mode {
+            PreviewPointerMode::PendingClick { .. } => None,
+            PreviewPointerMode::NewSelection {
+                anchor_ratio,
+                current_ratio,
+            } => selection_trim(anchor_ratio, current_ratio, self.width),
+            PreviewPointerMode::AdjustStart { current, .. }
+            | PreviewPointerMode::AdjustEnd { current, .. } => Some(current),
         }
     }
+
+    fn current_ratio(&self) -> f32 {
+        match self.mode {
+            PreviewPointerMode::PendingClick { current_ratio, .. }
+            | PreviewPointerMode::NewSelection { current_ratio, .. } => current_ratio,
+            PreviewPointerMode::AdjustStart { current, .. } => current.start_ratio,
+            PreviewPointerMode::AdjustEnd { current, .. } => current.end_ratio,
+        }
+    }
+
+    fn take_release_for_path(
+        scrub: &mut Option<Self>,
+        path: &Path,
+    ) -> Option<PreviewPointerRelease> {
+        let scrub = (scrub.as_ref().is_some_and(|scrub| scrub.path == path))
+            .then(|| scrub.take())
+            .flatten()?;
+        Some(match scrub.mode {
+            PreviewPointerMode::PendingClick { current_ratio, .. } => {
+                PreviewPointerRelease::Seek(current_ratio)
+            }
+            PreviewPointerMode::NewSelection { .. } => scrub
+                .provisional_trim()
+                .map(PreviewPointerRelease::Commit)
+                .unwrap_or(PreviewPointerRelease::Unchanged),
+            PreviewPointerMode::AdjustStart { original, current }
+            | PreviewPointerMode::AdjustEnd { original, current } => {
+                if original == current {
+                    PreviewPointerRelease::Unchanged
+                } else {
+                    PreviewPointerRelease::Commit(current)
+                }
+            }
+        })
+    }
+}
+
+fn selection_trim(first: f32, second: f32, width: f32) -> Option<TrimRange> {
+    let minimum = 1. / width.max(1.);
+    let (mut start, mut end) = (
+        first.min(second).clamp(0., 1.),
+        first.max(second).clamp(0., 1.),
+    );
+    if end - start < minimum {
+        if start + minimum <= 1. {
+            end = start + minimum;
+        } else {
+            start = (end - minimum).max(0.);
+        }
+    }
+    TrimRange::normalized(start, end)
+}
+
+fn adjust_trim_edge(range: TrimRange, edge: TrimEdge, ratio: f32, width: f32) -> TrimRange {
+    let minimum = 1. / width.max(1.);
+    match edge {
+        TrimEdge::Start => TrimRange::new(
+            ratio.clamp(0., (range.end_ratio - minimum).max(0.)),
+            range.end_ratio,
+        ),
+        TrimEdge::End => TrimRange::new(
+            range.start_ratio,
+            ratio.clamp((range.start_ratio + minimum).min(1.), 1.),
+        ),
+    }
+    .unwrap_or(range)
 }
 
 pub struct FileTable {
@@ -491,7 +660,7 @@ impl FileTable {
                         this.preview_scrub
                             .as_ref()
                             .filter(|scrub| scrub.path == path)
-                            .map(|scrub| scrub.ratio)
+                            .map(PreviewScrub::current_ratio)
                             .or_else(|| library.read(cx).preview_playhead_ratio_for_path(path))
                     });
                     Self::store_preview_playhead(&this.preview_playhead_bits, ratio);
@@ -1068,31 +1237,56 @@ impl FileTable {
             .update(cx, |lib, cx| lib.play_preview_from_ratio(path, ratio, cx))
     }
 
-    fn begin_preview_scrub(&mut self, path: PathBuf, ratio: f32, cx: &mut Context<Self>) {
+    fn begin_preview_scrub(
+        &mut self,
+        path: PathBuf,
+        ratio: f32,
+        x: f32,
+        width: f32,
+        edge: Option<TrimEdge>,
+        persisted: Option<TrimRange>,
+        cx: &mut Context<Self>,
+    ) {
         self.cancel_unstarted_file_drag(cx);
-        let scrub = PreviewScrub::new(path, ratio);
+        let scrub = PreviewScrub::new(path, ratio, x, width, edge, persisted);
         if self.preview_scrub.as_ref() != Some(&scrub) {
             self.preview_scrub = Some(scrub);
             cx.notify();
         }
     }
 
-    fn continue_preview_scrub(&mut self, path: &Path, ratio: f32, cx: &mut Context<Self>) {
+    fn continue_preview_scrub(&mut self, path: &Path, ratio: f32, x: f32, cx: &mut Context<Self>) {
         let Some(scrub) = self.preview_scrub.as_mut() else {
             return;
         };
-        let previous_ratio = scrub.ratio;
-        if scrub.update(path, ratio) && scrub.ratio != previous_ratio {
+        if scrub.update(path, ratio, x) {
             cx.notify();
         }
     }
 
     fn end_preview_scrub(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(ratio) = PreviewScrub::take_ratio_for_path(&mut self.preview_scrub, path) else {
+        let Some(release) = PreviewScrub::take_release_for_path(&mut self.preview_scrub, path)
+        else {
             return;
         };
         cx.notify();
-        self.play_preview_from_ratio(path.to_path_buf(), ratio, cx);
+        match release {
+            PreviewPointerRelease::Seek(ratio) => {
+                self.play_preview_from_ratio(path.to_path_buf(), ratio, cx);
+            }
+            PreviewPointerRelease::Commit(range) => {
+                self.library
+                    .update(cx, |library, cx| library.commit_trim(path, range, cx));
+            }
+            PreviewPointerRelease::Unchanged => {}
+        }
+    }
+
+    fn cancel_preview_trim(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.preview_scrub = None;
+        self.library
+            .update(cx, |library, cx| library.cancel_trim(path, cx));
+        cx.notify();
     }
 
     fn maybe_start_priority_waveform_cache(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -2116,7 +2310,30 @@ impl FileTable {
         }
 
         let drag_label = active.label;
-        let drag_paths = active.paths;
+        let internal_drop_paths = active.paths;
+        let drag_paths = match self
+            .library
+            .read(cx)
+            .external_drag_paths(&internal_drop_paths)
+        {
+            Ok(paths) => paths,
+            Err(state) => {
+                let message = match state {
+                    TrimArtifactState::Failed => "Trim export failed. Adjust the trim to retry.",
+                    TrimArtifactState::Building => "Trim is still being prepared.",
+                    TrimArtifactState::Missing | TrimArtifactState::Stale => {
+                        "Trim is not ready yet."
+                    }
+                    TrimArtifactState::Ready => "Trim artifact is unavailable.",
+                };
+                window.push_notification(message, cx);
+                self.native_drag_session.finish();
+                self.library
+                    .update(cx, |library, cx| library.clear_internal_file_drag(cx));
+                window.on_next_frame(|window, _| native_drag::cancel_gpui_drag(window));
+                return;
+            }
+        };
         let drag_path_count = drag_paths.len();
         let native_drag_label = if drag_path_count > 1 {
             format!("{drag_label} · {drag_path_count} files")
@@ -2125,7 +2342,6 @@ impl FileTable {
         };
         let (drag_finished_tx, mut drag_finished_rx) = mpsc::unbounded::<native_drag::DragEnd>();
         let window_bounds = window.bounds();
-        let internal_drop_paths = drag_paths.clone();
         let library = self.library.clone();
         cx.spawn(async move |_, cx| {
             if let Some(end) = drag_finished_rx.next().await {

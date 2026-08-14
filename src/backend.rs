@@ -11,10 +11,12 @@ use crate::model::{
 
 mod conversion;
 mod scanner;
+mod trim;
 
 use conversion::convert_file_to_format;
 pub(crate) use conversion::import_to_folder;
 use scanner::{file_stem, scan_category_folder};
+pub(crate) use trim::{TrimBuildRequest, TrimGenerationGate, TrimGenerationOutcome};
 
 #[derive(Clone, Debug)]
 pub struct RenameRecord {
@@ -25,13 +27,19 @@ pub struct RenameRecord {
 pub struct Backend {
     db: Database,
     folders: BTreeMap<Category, PathBuf>,
+    trims_dir: PathBuf,
 }
 
 impl Backend {
     pub fn new(db_path: PathBuf) -> io::Result<Self> {
+        let trims_dir = db_path
+            .parent()
+            .map(|parent| parent.join("trims"))
+            .unwrap_or_else(|| PathBuf::from("trims"));
         Ok(Self {
             db: Database::open(&db_path)?,
             folders: BTreeMap::new(),
+            trims_dir,
         })
     }
 
@@ -56,6 +64,7 @@ impl Backend {
         let refresh_start = crate::perf::start();
         let Some(folder) = self.folders.get(&category) else {
             let summary = self.db.sync_category(category, Vec::new())?;
+            self.reconcile_trim_records(category)?;
             crate::perf::finish("backend.refresh_category", refresh_start, || {
                 format!(
                     "category={} records=0 missing_folder=true removed={}",
@@ -68,6 +77,7 @@ impl Backend {
 
         if !folder.is_dir() {
             let summary = self.db.sync_category(category, Vec::new())?;
+            self.reconcile_trim_records(category)?;
             crate::perf::finish("backend.refresh_category", refresh_start, || {
                 format!(
                     "category={} records=0 invalid_folder=true removed={}",
@@ -83,6 +93,7 @@ impl Backend {
 
         let records_len = scan.records.len();
         let summary = self.db.sync_category(category, scan.records)?;
+        self.reconcile_trim_records(category)?;
         crate::perf::finish("backend.refresh_category", refresh_start, || {
             format!(
                 "category={} records={records_len} files_seen={} dirs_seen={} skipped={} reused={} tags_read={} added={} updated={} removed={}",
@@ -189,12 +200,15 @@ impl Backend {
         records: &[RenameRecord],
         new_stem: &str,
     ) -> io::Result<usize> {
-        rename_record_files(records, new_stem)?;
+        let renamed = rename_record_files(records, new_stem)?;
+        for (source, destination) in &renamed {
+            self.transfer_trim(source, destination)?;
+        }
         for record in records {
             self.db.rename_stem_tags(category, &record.stem, new_stem)?;
         }
         self.refresh_category(category)?;
-        Ok(records.iter().map(|record| record.paths.len()).sum())
+        Ok(renamed.len())
     }
 
     pub fn copy_tags_between_categories(
@@ -303,7 +317,14 @@ impl Backend {
         let folder = source.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "source has no parent folder")
         })?;
-        convert_file_to_format(source, folder, target, behavior, on_progress)
+        let destination = convert_file_to_format(source, folder, target, behavior, on_progress)?;
+        if source != destination {
+            let copied_trim = self.copy_trim(source, &destination)?;
+            if copied_trim && !source.exists() {
+                self.clear_trims(&[source.to_path_buf()])?;
+            }
+        }
+        Ok(destination)
     }
 
     pub fn trash_files(paths: Vec<PathBuf>) -> io::Result<usize> {
@@ -326,7 +347,10 @@ fn trash_files(paths: Vec<PathBuf>) -> io::Result<usize> {
     Ok(path_count)
 }
 
-fn rename_record_files(records: &[RenameRecord], new_stem: &str) -> io::Result<usize> {
+fn rename_record_files(
+    records: &[RenameRecord],
+    new_stem: &str,
+) -> io::Result<Vec<(PathBuf, PathBuf)>> {
     let new_stem = valid_file_stem(new_stem)?;
     let mut source_paths = BTreeSet::new();
     let mut planned = Vec::new();
@@ -369,13 +393,13 @@ fn rename_record_files(records: &[RenameRecord], new_stem: &str) -> io::Result<u
         }
     }
 
-    let mut renamed = 0;
+    let mut renamed = Vec::new();
     for (source, destination) in planned {
         if source == destination {
             continue;
         }
         fs::rename(&source, &destination)?;
-        renamed += 1;
+        renamed.push((source, destination));
     }
     Ok(renamed)
 }

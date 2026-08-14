@@ -15,22 +15,68 @@ fn cmd_preview_does_not_activate_during_row_editing() {
 }
 
 #[test]
-fn preview_scrub_commits_only_when_taken_for_release_path() {
+fn sub_threshold_preview_movement_seeks_once_on_release() {
     let path = PathBuf::from("/tmp/preview.wav");
-    let mut scrub = Some(PreviewScrub::new(path.clone(), 0.2));
+    let mut scrub = Some(PreviewScrub::new(path.clone(), 0.2, 20., 100., None, None));
 
-    assert!(scrub.as_mut().unwrap().update(&path, 0.7));
-    assert_eq!(scrub.as_ref().map(|scrub| scrub.ratio), Some(0.7));
+    assert!(scrub.as_mut().unwrap().update(&path, 0.23, 23.));
     assert_eq!(
-        PreviewScrub::take_ratio_for_path(&mut scrub, Path::new("/tmp/other.wav")),
+        PreviewScrub::take_release_for_path(&mut scrub, Path::new("/tmp/other.wav")),
         None
     );
     assert!(scrub.is_some());
     assert_eq!(
-        PreviewScrub::take_ratio_for_path(&mut scrub, &path),
-        Some(0.7)
+        PreviewScrub::take_release_for_path(&mut scrub, &path),
+        Some(PreviewPointerRelease::Seek(0.23))
     );
     assert!(scrub.is_none());
+    assert_eq!(PreviewScrub::take_release_for_path(&mut scrub, &path), None);
+}
+
+#[test]
+fn threshold_preview_movement_creates_normalized_trim() {
+    let path = PathBuf::from("/tmp/preview.wav");
+    let mut scrub = Some(PreviewScrub::new(path.clone(), 0.8, 80., 100., None, None));
+
+    assert!(scrub.as_mut().unwrap().update(&path, 0.3, 30.));
+    assert_eq!(
+        PreviewScrub::take_release_for_path(&mut scrub, &path),
+        Some(PreviewPointerRelease::Commit(
+            TrimRange::new(0.3, 0.8).unwrap()
+        ))
+    );
+}
+
+#[test]
+fn trim_handles_clamp_to_one_pixel_without_crossing() {
+    let path = PathBuf::from("/tmp/preview.wav");
+    let original = TrimRange::new(0.2, 0.8).unwrap();
+    let mut start = PreviewScrub::new(
+        path.clone(),
+        0.2,
+        20.,
+        100.,
+        Some(TrimEdge::Start),
+        Some(original),
+    );
+    start.update(&path, 0.95, 95.);
+    assert_eq!(
+        start.provisional_trim(),
+        Some(TrimRange::new(0.79, 0.8).unwrap())
+    );
+
+    let mut end = PreviewScrub::new(
+        path.clone(),
+        0.8,
+        80.,
+        100.,
+        Some(TrimEdge::End),
+        Some(original),
+    );
+    end.update(&path, 0.05, 5.);
+    let adjusted = end.provisional_trim().unwrap();
+    assert!((adjusted.start_ratio - 0.2).abs() < f32::EPSILON);
+    assert!((adjusted.end_ratio - 0.21).abs() < 0.000_001);
 }
 
 #[test]

@@ -81,10 +81,16 @@ impl FileTable {
             self.preview_scrub
                 .as_ref()
                 .filter(|scrub| scrub.path == path)
-                .map(|scrub| scrub.ratio)
+                .map(PreviewScrub::current_ratio)
                 .or_else(|| self.library.read(cx).preview_playhead_ratio_for_path(&path))
         });
         let playhead_ratio = playhead_ratio.flatten();
+        let trim = self
+            .preview_scrub
+            .as_ref()
+            .filter(|scrub| scrub.path == path)
+            .and_then(PreviewScrub::provisional_trim)
+            .or_else(|| record.effective_row_trim());
         if preview_active {
             Self::store_preview_playhead(&self.preview_playhead_bits, playhead_ratio);
         }
@@ -364,6 +370,7 @@ impl FileTable {
                     cx.entity(),
                     path.clone(),
                     waveform,
+                    trim,
                     self.preview_playhead_bits.clone(),
                 )))
             })

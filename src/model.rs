@@ -10,6 +10,39 @@ pub const TAG_TYPE: &str = "TYPE";
 pub const WAVEFORM_BAR_COUNT: usize = 256;
 pub type WaveformBinary256 = [u8; WAVEFORM_BAR_COUNT];
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrimRange {
+    pub start_ratio: f32,
+    pub end_ratio: f32,
+}
+
+impl TrimRange {
+    pub fn new(start_ratio: f32, end_ratio: f32) -> Option<Self> {
+        if !start_ratio.is_finite() || !end_ratio.is_finite() {
+            return None;
+        }
+        let start_ratio = start_ratio.clamp(0., 1.);
+        let end_ratio = end_ratio.clamp(0., 1.);
+        (start_ratio < end_ratio).then_some(Self {
+            start_ratio,
+            end_ratio,
+        })
+    }
+
+    pub fn normalized(first: f32, second: f32) -> Option<Self> {
+        Self::new(first.min(second), first.max(second))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimArtifactState {
+    Missing,
+    Stale,
+    Building,
+    Ready,
+    Failed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Category {
     Music,
@@ -97,6 +130,14 @@ impl FileRecord {
             .and_then(|variant| variant.waveform.as_ref())
     }
 
+    pub fn effective_row_trim(&self) -> Option<TrimRange> {
+        self.variants.iter().find_map(|variant| variant.trim)
+    }
+
+    pub fn external_drag_path(&self) -> Option<&PathBuf> {
+        self.primary_variant()?.external_drag_path()
+    }
+
     pub fn conversion_targets(&self) -> Vec<AudioFormat> {
         AudioFormat::ALL
             .into_iter()
@@ -105,7 +146,7 @@ impl FileRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileVariant {
     pub path: PathBuf,
     pub extension: String,
@@ -113,6 +154,19 @@ pub struct FileVariant {
     pub modified: i64,
     pub first_seen_at: i64,
     pub waveform: Option<WaveformBinary256>,
+    pub trim: Option<TrimRange>,
+    pub trim_artifact_path: Option<PathBuf>,
+    pub trim_artifact_state: Option<TrimArtifactState>,
+}
+
+impl FileVariant {
+    pub fn external_drag_path(&self) -> Option<&PathBuf> {
+        match (self.trim, self.trim_artifact_state) {
+            (None, _) => Some(&self.path),
+            (Some(_), Some(TrimArtifactState::Ready)) => self.trim_artifact_path.as_ref(),
+            (Some(_), _) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -505,12 +559,29 @@ mod tests {
                 modified: 0,
                 first_seen_at: 0,
                 waveform: None,
+                trim: None,
+                trim_artifact_path: None,
+                trim_artifact_state: None,
             }],
             tags: tags
                 .iter()
                 .map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn trimmed_variant_only_exposes_ready_artifact_for_external_drag() {
+        let mut record = rec("clip.wav", &[]);
+        let artifact = PathBuf::from("/tmp/trimmed-clip.wav");
+        let variant = &mut record.variants[0];
+        variant.trim = TrimRange::new(0.2, 0.8);
+        variant.trim_artifact_path = Some(artifact.clone());
+        variant.trim_artifact_state = Some(TrimArtifactState::Building);
+        assert_eq!(record.external_drag_path(), None);
+
+        record.variants[0].trim_artifact_state = Some(TrimArtifactState::Ready);
+        assert_eq!(record.external_drag_path(), Some(&artifact));
     }
 
     fn sel(pairs: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {

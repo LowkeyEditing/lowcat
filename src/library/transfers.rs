@@ -29,6 +29,7 @@ struct ConvertBatchResult {
 struct TrashBatchResult {
     category: Category,
     file_count: usize,
+    paths: Vec<PathBuf>,
     result: io::Result<usize>,
 }
 
@@ -364,12 +365,15 @@ impl Library {
 
         let category = self.active;
         let file_count = paths.len();
+        self.invalidate_trim_generations(&paths);
+        let trash_paths = paths.clone();
 
         let trash_task = cx.background_spawn(async move {
             let result = Backend::trash_files(paths);
             TrashBatchResult {
                 category,
                 file_count,
+                paths: trash_paths,
                 result,
             }
         });
@@ -487,6 +491,14 @@ impl Library {
             }
             if let Some(origin) = moved_from {
                 for (source, destination) in &result.moved_files {
+                    self.invalidate_trim_generations(std::slice::from_ref(source));
+                    if let Err(error) = self.backend.transfer_trim(source, destination) {
+                        eprintln!(
+                            "lowcat cross-category trim move failed source={} destination={} error={error}",
+                            source.display(),
+                            destination.display()
+                        );
+                    }
                     if let Err(error) = self.backend.copy_tags_between_categories(
                         origin,
                         result.category,
@@ -537,6 +549,8 @@ impl Library {
                 let _ = self.backend.refresh_category(origin);
                 self.refresh_category_state(origin);
             }
+            let _ = self.backend.reconcile_orphan_trims();
+            self.retry_trim_artifacts(cx);
         }
         cx.notify();
     }
@@ -548,17 +562,25 @@ impl Library {
             let _ = self.backend.refresh_category(result.category);
             self.refresh_category_state(result.category);
             self.maybe_start_waveform_cache(cx);
+            self.retry_trim_artifacts(cx);
         }
         cx.notify();
     }
 
     fn finish_trash_files(&mut self, result: TrashBatchResult, cx: &mut Context<Self>) {
-        if let Err(error) = result.result {
-            eprintln!(
-                "lowcat trash batch failed category={} requested={} error={error}",
-                result.category.label(),
-                result.file_count
-            );
+        match result.result {
+            Ok(_) => {
+                if let Err(error) = self.backend.clear_trims(&result.paths) {
+                    eprintln!("lowcat trim cleanup after trash failed error={error}");
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "lowcat trash batch failed category={} requested={} error={error}",
+                    result.category.label(),
+                    result.file_count
+                );
+            }
         }
         if let Err(error) = self.backend.refresh_category(result.category) {
             eprintln!(
@@ -567,6 +589,7 @@ impl Library {
             );
         }
         self.refresh_category_state(result.category);
+        self.retry_trim_artifacts(cx);
         self.stop_preview_if_missing(cx);
         cx.notify();
     }

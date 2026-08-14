@@ -1,15 +1,21 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::FolderTagAssignment;
 
 fn db_path(name: &str) -> PathBuf {
+    static NEXT_DB_PATH: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     std::env::temp_dir()
-        .join(format!("lowcat-db-{name}-{}-{nanos}", std::process::id()))
+        .join(format!(
+            "lowcat-db-{name}-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT_DB_PATH.fetch_add(1, Ordering::Relaxed)
+        ))
         .join("library.sqlite")
 }
 
@@ -53,6 +59,129 @@ fn scan_path(path: &str) -> FileScanRecord {
 
 fn waveform(value: u8) -> WaveformBinary256 {
     [value; 256]
+}
+
+#[test]
+fn trim_range_round_trips_after_database_reopen() {
+    let path = db_path("trim-restart");
+    let source = PathBuf::from("/tmp/restart-trim.wav");
+    let artifact = path.parent().unwrap().join("trims/restart-trim.wav");
+    let range = TrimRange::new(0.2, 0.75).unwrap();
+    {
+        let db = Database::open(&path).unwrap();
+        db.sync_category(Category::Music, vec![scan_path(source.to_str().unwrap())])
+            .unwrap();
+        db.set_trim(&source, range, &artifact, 1, 1).unwrap();
+    }
+
+    let reopened = Database::open(&path).unwrap();
+    let trim = reopened.trim_for_path(&source).unwrap().unwrap();
+    assert_eq!(trim.range, range);
+    assert_eq!(trim.artifact_path, artifact);
+    let rows = reopened
+        .query_visible_rows(
+            Category::Music,
+            "",
+            &BTreeMap::new(),
+            &default_format_priority(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(rows[0].effective_row_trim(), Some(range));
+    assert_eq!(
+        rows[0].variants[0].trim_artifact_state,
+        Some(TrimArtifactState::Missing)
+    );
+}
+
+#[test]
+fn source_fingerprint_change_marks_existing_trim_artifact_stale() {
+    let path = db_path("trim-stale");
+    let artifact = path.parent().unwrap().join("trims/stale.wav");
+    fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    fs::write(&artifact, b"artifact").unwrap();
+    let source = PathBuf::from("/tmp/stale.wav");
+    let range = TrimRange::new(0.1, 0.9).unwrap();
+    let db = Database::open(&path).unwrap();
+    db.sync_category(Category::Music, vec![scan_path(source.to_str().unwrap())])
+        .unwrap();
+    db.set_trim(&source, range, &artifact, 1, 1).unwrap();
+    assert!(db.mark_trim_artifact_ready(&source, range, 1, 1).unwrap());
+
+    let ready = db
+        .query_visible_rows(
+            Category::Music,
+            "",
+            &BTreeMap::new(),
+            &default_format_priority(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        ready[0].variants[0].trim_artifact_state,
+        Some(TrimArtifactState::Ready)
+    );
+
+    let mut changed = scan_path(source.to_str().unwrap());
+    changed.size = 2;
+    changed.modified = 2;
+    db.sync_category(Category::Music, vec![changed]).unwrap();
+    let stale = db
+        .query_visible_rows(
+            Category::Music,
+            "",
+            &BTreeMap::new(),
+            &default_format_priority(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        stale[0].variants[0].trim_artifact_state,
+        Some(TrimArtifactState::Stale)
+    );
+}
+
+#[test]
+fn trim_transfer_and_clear_update_persisted_source_path() {
+    let db = Database::open(&db_path("trim-transfer")).unwrap();
+    let source = PathBuf::from("/tmp/trim-source.wav");
+    let destination = PathBuf::from("/tmp/trim-destination.wav");
+    let old_artifact = PathBuf::from("/tmp/old-trim.wav");
+    let new_artifact = PathBuf::from("/tmp/new-trim.wav");
+    db.sync_category(
+        Category::Music,
+        vec![
+            scan_path(source.to_str().unwrap()),
+            scan_path(destination.to_str().unwrap()),
+        ],
+    )
+    .unwrap();
+    db.set_trim(
+        &source,
+        TrimRange::new(0.25, 0.5).unwrap(),
+        &old_artifact,
+        1,
+        1,
+    )
+    .unwrap();
+
+    assert!(
+        db.transfer_trim(&source, &destination, &new_artifact, 1, 1)
+            .unwrap()
+    );
+    assert!(db.trim_for_path(&source).unwrap().is_none());
+    assert_eq!(
+        db.trim_for_path(&destination)
+            .unwrap()
+            .unwrap()
+            .artifact_path,
+        new_artifact
+    );
+    assert_eq!(
+        db.clear_trims(std::slice::from_ref(&destination)).unwrap(),
+        vec![new_artifact]
+    );
+    assert!(db.trim_for_path(&destination).unwrap().is_none());
 }
 
 #[test]
