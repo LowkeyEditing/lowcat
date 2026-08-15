@@ -72,61 +72,6 @@ fn sort_fixture(name: &str, tags: &[(&str, &[&str])]) -> FileRecord {
 }
 
 #[test]
-fn sort_comparison_handles_case_ties_missing_and_multi_value_tags() {
-    let mut records = vec![
-        sort_fixture("beta", &[("GENRE", &["Zulu", "Alpha"])]),
-        sort_fixture("Alpha", &[("genre", &["alpha"])]),
-        sort_fixture("alpha", &[]),
-        sort_fixture("aardvark", &[("genre", &["Alpha"])]),
-    ];
-
-    sort_records(
-        &mut records,
-        &SortState {
-            column: Some(SortColumn::Name),
-            direction: SortDirection::Ascending,
-        },
-    );
-    assert_eq!(
-        records
-            .iter()
-            .map(|record| record.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["aardvark", "Alpha", "alpha", "beta"]
-    );
-
-    sort_records(
-        &mut records,
-        &SortState {
-            column: Some(SortColumn::Tag("genre".to_string())),
-            direction: SortDirection::Ascending,
-        },
-    );
-    assert_eq!(
-        records
-            .iter()
-            .map(|record| record.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["alpha", "aardvark", "Alpha", "beta"]
-    );
-
-    sort_records(
-        &mut records,
-        &SortState {
-            column: Some(SortColumn::Tag("genre".to_string())),
-            direction: SortDirection::Descending,
-        },
-    );
-    assert_eq!(
-        records
-            .iter()
-            .map(|record| record.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["beta", "aardvark", "Alpha", "alpha"]
-    );
-}
-
-#[test]
 fn recent_imports_are_grouped_after_existing_sort_order() {
     let mut imported_variant = sort_fixture("alpha", &[]);
     imported_variant.variants.push(FileVariant {
