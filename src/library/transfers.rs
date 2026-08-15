@@ -64,7 +64,12 @@ impl Library {
         cx: &mut Context<Self>,
     ) {
         self.downloader_open = true;
+        let filters_were_open = self.filters_open;
         self.filters_open = false;
+        if filters_were_open {
+            self.clear_import_priority();
+            self.refresh_search_results(self.active);
+        }
 
         if matches!(self.download_state, DownloadState::Running(_)) {
             debug_downloader_interaction(|| {
@@ -483,6 +488,12 @@ impl Library {
             .moved_from
             .filter(|origin| *origin != result.category);
         if result.imported {
+            self.recent_import_paths.extend(
+                result
+                    .moved_files
+                    .iter()
+                    .map(|(_, destination)| destination.clone()),
+            );
             if let Err(error) = self.backend.refresh_category(result.category) {
                 eprintln!(
                     "lowcat import refresh failed category={} error={error}",
@@ -568,6 +579,7 @@ impl Library {
     }
 
     fn finish_trash_files(&mut self, result: TrashBatchResult, cx: &mut Context<Self>) {
+        self.clear_import_priority();
         match result.result {
             Ok(_) => {
                 if let Err(error) = self.backend.clear_trims(&result.paths) {

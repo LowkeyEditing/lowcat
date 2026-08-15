@@ -126,6 +126,136 @@ fn sort_comparison_handles_case_ties_missing_and_multi_value_tags() {
 }
 
 #[test]
+fn recent_imports_are_grouped_after_existing_sort_order() {
+    let mut imported_variant = sort_fixture("alpha", &[]);
+    imported_variant.variants.push(FileVariant {
+        path: PathBuf::from("/tmp/imported-alpha.flac"),
+        extension: "flac".to_string(),
+        size: 0,
+        modified: 0,
+        first_seen_at: 0,
+        waveform: None,
+        trim: None,
+        trim_artifact_path: None,
+        trim_artifact_state: None,
+    });
+    let records = vec![
+        sort_fixture("zulu", &[]),
+        sort_fixture("middle", &[]),
+        imported_variant,
+    ];
+    let recent_import_paths = BTreeSet::from([PathBuf::from("/tmp/imported-alpha.flac")]);
+    let results = filter_cached_records(
+        &records,
+        "",
+        &BTreeMap::new(),
+        false,
+        &SortState {
+            column: Some(SortColumn::Name),
+            direction: SortDirection::Descending,
+        },
+        &recent_import_paths,
+    );
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "zulu", "middle"]
+    );
+    assert!(
+        records[2]
+            .variants
+            .iter()
+            .any(|variant| { recent_import_paths.contains(&variant.path) })
+    );
+}
+
+#[test]
+fn search_relevance_precedes_explicit_sort_order() {
+    let records = vec![sort_fixture("alpha", &[]), sort_fixture("zebra", &[])];
+    let results = filter_cached_records(
+        &records,
+        "a",
+        &BTreeMap::new(),
+        false,
+        &SortState {
+            column: Some(SortColumn::Name),
+            direction: SortDirection::Descending,
+        },
+        &BTreeSet::new(),
+    );
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "zebra"]
+    );
+}
+
+#[gpui::test]
+fn recent_import_priority_survives_refresh_and_clears_on_view_changes(
+    cx: &mut gpui::TestAppContext,
+) {
+    let settings_path = settings_path("recent-import-view-state");
+    let (music_dir, sfx_dir) = settings_with_folders(&settings_path);
+    fixture(&music_dir, "zulu.flac", &[]);
+    let imported = fixture(&music_dir, "alpha.flac", &[]);
+    let second_imported = fixture(&music_dir, "zulu.flac", &[]);
+    fixture(&music_dir, "normal.flac", &[]);
+    fixture(&sfx_dir, "sfx.flac", &[]);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+    let pin_and_refresh = |library: &gpui::Entity<Library>, cx: &mut gpui::TestAppContext| {
+        library.update(cx, |lib, _| {
+            lib.recent_import_paths.insert(imported.clone());
+            lib.refresh_category_state(Category::Music);
+        });
+    };
+    let names = |library: &gpui::Entity<Library>, cx: &mut gpui::TestAppContext| {
+        library.read_with(cx, |lib, _| {
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+
+    library.update(cx, |lib, cx| lib.toggle_sort(SortColumn::Name, cx));
+    pin_and_refresh(&library, cx);
+    assert_eq!(names(&library, cx), vec!["alpha", "normal", "zulu"]);
+
+    library.update(cx, |lib, cx| lib.toggle_sort(SortColumn::Name, cx));
+    assert_eq!(names(&library, cx), vec!["alpha", "zulu", "normal"]);
+
+    library.update(cx, |lib, _| {
+        lib.recent_import_paths.insert(second_imported.clone());
+        lib.refresh_category_state(Category::Music);
+    });
+    assert_eq!(names(&library, cx), vec!["zulu", "alpha", "normal"]);
+
+    library.update(cx, |lib, cx| lib.set_search("z".to_string(), cx));
+    assert!(library.read_with(cx, |lib, _| lib.recent_import_paths.is_empty()));
+
+    pin_and_refresh(&library, cx);
+    library.update(cx, |lib, cx| lib.toggle_filters(cx));
+    assert!(library.read_with(cx, |lib, _| lib.recent_import_paths.is_empty()));
+
+    pin_and_refresh(&library, cx);
+    library.update(cx, |lib, cx| lib.set_category(Category::Sfx, cx));
+    assert!(library.read_with(cx, |lib, _| lib.recent_import_paths.is_empty()));
+
+    library.update(cx, |lib, cx| lib.set_category(Category::Music, cx));
+    pin_and_refresh(&library, cx);
+    library.update(cx, |lib, cx| lib.toggle_sort(SortColumn::Name, cx));
+    assert!(library.read_with(cx, |lib, _| !lib.recent_import_paths.is_empty()));
+}
+
+#[test]
 fn removed_and_renamed_tag_sort_columns_reconcile_with_schema() {
     let mut sort = SortState {
         column: Some(SortColumn::Tag("genre".to_string())),
@@ -171,7 +301,7 @@ fn active_sort_survives_search_and_category_refresh(cx: &mut gpui::TestAppContex
             .map(|record| record.name.clone())
             .collect::<Vec<_>>()
     });
-    assert_eq!(filtered, vec!["Alpha", "middle", "zulu"]);
+    assert_eq!(filtered, vec!["Alpha", "zulu", "middle"]);
 
     library.update(cx, |lib, _| lib.refresh_category_state(Category::Music));
     let refreshed = library.read_with(cx, |lib, _| {
@@ -185,7 +315,7 @@ fn active_sort_survives_search_and_category_refresh(cx: &mut gpui::TestAppContex
         )
     });
     assert_eq!(refreshed.0.column, Some(SortColumn::Name));
-    assert_eq!(refreshed.1, vec!["Alpha", "middle", "zulu"]);
+    assert_eq!(refreshed.1, vec!["Alpha", "zulu", "middle"]);
 
     library.update(cx, |lib, cx| {
         lib.toggle_sort(SortColumn::Name, cx);
@@ -201,7 +331,7 @@ fn active_sort_survives_search_and_category_refresh(cx: &mut gpui::TestAppContex
         )
     });
     assert_eq!(descending.0, SortDirection::Descending);
-    assert_eq!(descending.1, vec!["zulu", "middle", "Alpha"]);
+    assert_eq!(descending.1, vec!["Alpha", "zulu", "middle"]);
 
     library.update(cx, |lib, cx| {
         lib.toggle_sort(SortColumn::Tag("genre".to_string()), cx);
@@ -223,7 +353,7 @@ fn active_sort_survives_search_and_category_refresh(cx: &mut gpui::TestAppContex
             direction: SortDirection::Ascending,
         }
     );
-    assert_eq!(tag_sorted.1, vec!["Alpha", "middle", "zulu"]);
+    assert_eq!(tag_sorted.1, vec!["Alpha", "zulu", "middle"]);
 
     library.update(cx, |lib, cx| {
         lib.toggle_sort(SortColumn::Tag("GENRE".to_string()), cx);
@@ -239,7 +369,7 @@ fn active_sort_survives_search_and_category_refresh(cx: &mut gpui::TestAppContex
         )
     });
     assert_eq!(tag_descending.0, SortDirection::Descending);
-    assert_eq!(tag_descending.1, vec!["zulu", "middle", "Alpha"]);
+    assert_eq!(tag_descending.1, vec!["Alpha", "zulu", "middle"]);
 
     library.update(cx, |lib, cx| {
         lib.set_category(Category::Sfx, cx);
@@ -843,6 +973,34 @@ fn async_search_preserves_active_sort(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn async_search_clears_recent_import_priority(cx: &mut gpui::TestAppContext) {
+    let settings_path = settings_path("async-search-clears-imports");
+    let (music_dir, _) = settings_with_folders(&settings_path);
+    fixture(&music_dir, "alpha.flac", &[]);
+    fixture(&music_dir, "middle.flac", &[]);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+    library.update(cx, |lib, cx| {
+        lib.recent_import_paths.insert(music_dir.join("alpha.flac"));
+        lib.set_search_async("middle".to_string(), cx);
+    });
+    cx.run_until_parked();
+
+    let (recent_is_empty, names) = library.read_with(cx, |lib, _| {
+        (
+            lib.recent_import_paths.is_empty(),
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert!(recent_is_empty);
+    assert_eq!(names, vec!["middle"]);
+}
+
+#[gpui::test]
 fn unified_search_adds_tag_matches_only_while_filter_panel_is_open(cx: &mut gpui::TestAppContext) {
     let settings_path = settings_path("unified-name-tag-search");
     let (music_dir, _) = settings_with_folders(&settings_path);
@@ -915,6 +1073,30 @@ fn same_category_internal_drop_is_noop(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn failed_or_empty_import_does_not_change_recent_priority(cx: &mut gpui::TestAppContext) {
+    let settings_path = settings_path("failed-import-priority");
+    let (music_dir, _) = settings_with_folders(&settings_path);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+    let existing = music_dir.join("already-recent.flac");
+
+    library.update(cx, |lib, cx| {
+        lib.recent_import_paths.insert(existing.clone());
+        lib.import_files(Category::Music, Vec::new(), cx);
+    });
+    assert!(library.read_with(cx, |lib, _| lib.recent_import_paths.contains(&existing)));
+
+    library.update(cx, |lib, cx| {
+        lib.import_files(
+            Category::Music,
+            vec![music_dir.join("does-not-exist.flac")],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(library.read_with(cx, |lib, _| lib.recent_import_paths.contains(&existing)));
+}
+
+#[gpui::test]
 fn cross_category_internal_drop_moves_file(cx: &mut gpui::TestAppContext) {
     let settings_path = settings_path("cross-category-drop");
     let (music_dir, sfx_dir) = settings_with_folders(&settings_path);
@@ -951,8 +1133,8 @@ fn cross_category_internal_drop_moves_file(cx: &mut gpui::TestAppContext) {
 
     assert!(!music_file.exists());
     assert!(sfx_dir.join("move.flac").is_file());
-    let (music_count, sfx_count, sfx_tags, sfx_trim, sfx_trim_state) =
-        library.read_with(cx, |lib, _| {
+    let (music_count, sfx_count, sfx_tags, sfx_trim, sfx_trim_state, sfx_recent) = library
+        .read_with(cx, |lib, _| {
             let variant = &lib.states[&Category::Sfx].results[0].variants[0];
             (
                 lib.states[&Category::Music].results.len(),
@@ -960,6 +1142,7 @@ fn cross_category_internal_drop_moves_file(cx: &mut gpui::TestAppContext) {
                 lib.states[&Category::Sfx].results[0].tags.clone(),
                 variant.trim,
                 variant.trim_artifact_state,
+                lib.recent_import_paths.contains(&sfx_dir.join("move.flac")),
             )
         });
     assert_eq!(music_count, 0);
@@ -968,6 +1151,7 @@ fn cross_category_internal_drop_moves_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(sfx_tags["custom"], vec!["Favorite"]);
     assert_eq!(sfx_trim, TrimRange::new(0.2, 0.8));
     assert_eq!(sfx_trim_state, Some(TrimArtifactState::Ready));
+    assert!(sfx_recent);
 }
 
 #[gpui::test]
@@ -999,7 +1183,7 @@ fn file_import_waits_for_focus_rescan_before_refresh(cx: &mut gpui::TestAppConte
         lib.finish_focus_rescan(Ok(()), Instant::now(), cx);
     });
 
-    let (importing, deferred, names) = library.read_with(cx, |lib, _| {
+    let (importing, deferred, names, imported_path_is_recent) = library.read_with(cx, |lib, _| {
         (
             lib.importing,
             lib.deferred_import_result.is_some(),
@@ -1008,11 +1192,14 @@ fn file_import_waits_for_focus_rescan_before_refresh(cx: &mut gpui::TestAppConte
                 .iter()
                 .map(|record| record.name.clone())
                 .collect::<Vec<_>>(),
+            lib.recent_import_paths
+                .contains(&music_dir.join("dropped.flac")),
         )
     });
     assert!(!importing);
     assert!(!deferred);
     assert_eq!(names, vec!["dropped".to_string()]);
+    assert!(imported_path_is_recent);
     assert!(music_dir.join("dropped.flac").is_file());
 }
 
@@ -1036,9 +1223,19 @@ fn toggling_a_value_filters_active_results(cx: &mut gpui::TestAppContext) {
     let count = library.read_with(cx, |lib, _| lib.active_state().results.len());
     assert_eq!(count, 2);
 
+    library.update(cx, |lib, _| {
+        lib.recent_import_paths.insert(music_dir.join("dark.flac"));
+        lib.refresh_category_state(Category::Music);
+    });
     library.update(cx, |lib, cx| lib.toggle_value("genre", "Electronic", cx));
-    let count = library.read_with(cx, |lib, _| lib.active_state().results.len());
+    let (count, recent_is_empty) = library.read_with(cx, |lib, _| {
+        (
+            lib.active_state().results.len(),
+            lib.recent_import_paths.is_empty(),
+        )
+    });
     assert_eq!(count, 1);
+    assert!(recent_is_empty);
 
     library.update(cx, |lib, cx| lib.set_category(Category::Sfx, cx));
     let count = library.read_with(cx, |lib, _| lib.active_state().results.len());

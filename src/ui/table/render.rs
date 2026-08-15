@@ -74,6 +74,7 @@ impl FileTable {
     ) -> AnyElement {
         let path = record.path.clone();
         let convertible = record.is_convertible();
+        let recently_imported = self.library.read(cx).record_is_recently_imported(record);
         let selected = self.selected.contains(path.as_path());
         let preview_active = self.preview_active_row.as_ref() == Some(&path);
         let waveform = record.primary_waveform().copied();
@@ -110,6 +111,7 @@ impl FileTable {
             cx.theme().table_hover
         };
         let convertible_bg = hsla(0.095, 1., 0.55, 0.12);
+        let recently_imported_bg = cx.theme().success.opacity(0.14);
         let chip_delete_bg = red().opacity(0.18);
         let row_delete_bg = red().opacity(0.18);
         let format_chip_hovered = self.hovered_format_chip.as_ref().is_some_and(|hovered| {
@@ -163,6 +165,7 @@ impl FileTable {
                 s.border_t_1().border_color(cx.theme().table_row_border)
             })
             .when(convertible, |s| s.bg(convertible_bg))
+            .when(recently_imported, |s| s.bg(recently_imported_bg))
             .when(selected || row_hovered, |s| s.bg(row_hover_bg))
             .when(delete_hovered, |s| s.bg(row_delete_bg))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {

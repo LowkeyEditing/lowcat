@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,7 @@ pub struct Library {
     internal_file_drag: Option<InternalFileDrag>,
     importing: bool,
     import_progress: Option<ImportProgress>,
+    recent_import_paths: BTreeSet<PathBuf>,
     last_focus_rescan: Option<Instant>,
     focus_rescan_in_flight: bool,
     deferred_import_result: Option<transfers::ImportBatchResult>,
@@ -149,6 +151,7 @@ impl Library {
             internal_file_drag: None,
             importing: false,
             import_progress: None,
+            recent_import_paths: BTreeSet::new(),
             last_focus_rescan: None,
             focus_rescan_in_flight: false,
             deferred_import_result: None,
@@ -245,6 +248,17 @@ impl Library {
         }
         self.refresh_search_results(self.active);
         cx.notify();
+    }
+
+    pub(crate) fn record_is_recently_imported(&self, record: &FileRecord) -> bool {
+        record
+            .variants
+            .iter()
+            .any(|variant| self.recent_import_paths.contains(&variant.path))
+    }
+
+    fn clear_import_priority(&mut self) {
+        self.recent_import_paths.clear();
     }
 
     pub(crate) fn table_revision(&self) -> u64 {
@@ -354,6 +368,7 @@ impl Library {
         if self.filters_open {
             self.downloader_open = false;
         }
+        self.clear_import_priority();
         self.refresh_search_results(self.active);
         cx.notify();
     }
@@ -363,6 +378,7 @@ impl Library {
             return false;
         }
         self.filters_open = false;
+        self.clear_import_priority();
         self.refresh_search_results(self.active);
         cx.notify();
         true
@@ -374,6 +390,7 @@ impl Library {
             let filters_were_open = self.filters_open;
             self.filters_open = false;
             if filters_were_open {
+                self.clear_import_priority();
                 self.refresh_search_results(self.active);
             }
         }
@@ -383,6 +400,7 @@ impl Library {
 
     pub fn set_category(&mut self, category: Category, cx: &mut Context<Self>) {
         if self.active != category {
+            self.clear_import_priority();
             self.active = category;
             self.refresh_search_results(category);
             debug_library_interaction(|| {
@@ -402,7 +420,11 @@ impl Library {
     }
 
     pub fn set_search(&mut self, search: String, cx: &mut Context<Self>) {
+        let search_changed = self.active_state().search != search;
         self.search_generation = self.search_generation.wrapping_add(1);
+        if search_changed {
+            self.clear_import_priority();
+        }
         self.set_search_query(&search);
         self.refresh_search_results(self.active);
         self.log_search(&search);
@@ -410,7 +432,11 @@ impl Library {
     }
 
     pub fn set_search_async(&mut self, search: String, cx: &mut Context<Self>) {
+        let search_changed = self.active_state().search != search;
         self.search_generation = self.search_generation.wrapping_add(1);
+        if search_changed {
+            self.clear_import_priority();
+        }
         let generation = self.search_generation;
         self.set_search_query(&search);
         let category = self.active;
@@ -421,11 +447,18 @@ impl Library {
         };
         let include_tags = self.filters_open;
         let sort = self.states[&category].sort.clone();
+        let recent_import_paths = self.recent_import_paths.clone();
         let search_for_task = search.clone();
         let task = cx.background_spawn(async move {
             let start = crate::perf::start();
-            let results =
-                filter_cached_records(&records, &search_for_task, &selected, include_tags, &sort);
+            let results = filter_cached_records(
+                &records,
+                &search_for_task,
+                &selected,
+                include_tags,
+                &sort,
+                &recent_import_paths,
+            );
             crate::perf::finish("library.search.background", start, || {
                 format!(
                     "results={} search_len={} selected_keys={}",
@@ -598,15 +631,20 @@ impl Library {
                 set.insert(value.to_string());
             }
         }
+        self.clear_import_priority();
         self.refresh(cx);
     }
 
     pub fn remove_value(&mut self, key: &str, value: &str, cx: &mut Context<Self>) {
         let active = self.active;
+        let mut changed = false;
         if let Some(state) = self.states.get_mut(&active)
             && let Some(set) = state.selected.get_mut(key)
         {
-            set.remove(value);
+            changed = set.remove(value);
+        }
+        if changed {
+            self.clear_import_priority();
         }
         self.refresh(cx);
     }
@@ -621,6 +659,7 @@ impl Library {
         }
 
         state.selected.clear();
+        self.clear_import_priority();
         self.refresh(cx);
         true
     }
@@ -1241,6 +1280,7 @@ impl Library {
         settings.save(&self.settings_path)?;
         self.settings = settings;
         self.backend.set_category_folder(category, path)?;
+        self.clear_import_priority();
         self.refresh_category_state(category);
         self.maybe_start_waveform_cache(cx);
         cx.notify();
@@ -1411,8 +1451,14 @@ impl Library {
         reconcile_selected_filters(&mut selected, &schema, renamed_tag);
         reconcile_sort_state(&mut sort, &schema, renamed_key);
         let filter_start = crate::perf::start();
-        let results =
-            filter_cached_records(&all_records, &search, &selected, self.filters_open, &sort);
+        let results = filter_cached_records(
+            &all_records,
+            &search,
+            &selected,
+            self.filters_open,
+            &sort,
+            &self.recent_import_paths,
+        );
         crate::perf::finish("library.filter", filter_start, || {
             format!(
                 "category={} results={} search_len={} selected_keys={}",
@@ -1456,8 +1502,14 @@ impl Library {
                 SortState::default(),
             )
         };
-        let results =
-            filter_cached_records(&all_records, &search, &selected, self.filters_open, &sort);
+        let results = filter_cached_records(
+            &all_records,
+            &search,
+            &selected,
+            self.filters_open,
+            &sort,
+            &self.recent_import_paths,
+        );
         let results_len = results.len();
         self.states.entry(category).or_default().results = results;
         self.bump_results_revision();
@@ -1486,6 +1538,7 @@ impl Library {
                 for category in Category::ALL {
                     self.refresh_category_state(category);
                 }
+                self.prune_recent_import_paths();
                 self.stop_preview_if_missing(cx);
                 self.maybe_start_waveform_cache(cx);
                 self.retry_trim_artifacts(cx);
@@ -1512,6 +1565,20 @@ impl Library {
             .iter()
             .any(|drag_path| paths.iter().any(|path| paths_equal(drag_path, path)))
             .then_some(drag.category)
+    }
+
+    fn prune_recent_import_paths(&mut self) {
+        let known_paths: BTreeSet<PathBuf> =
+            self.states
+                .values()
+                .flat_map(|state| {
+                    state.all_records.iter().flat_map(|record| {
+                        record.variants.iter().map(|variant| variant.path.clone())
+                    })
+                })
+                .collect();
+        self.recent_import_paths
+            .retain(|path| known_paths.contains(path));
     }
 
     fn load_category_state(&self, category: Category) -> CategoryState {
@@ -1564,36 +1631,70 @@ fn filter_cached_records(
     selected: &BTreeMap<String, BTreeSet<String>>,
     include_tags: bool,
     sort: &SortState,
+    recent_import_paths: &BTreeSet<PathBuf>,
 ) -> Vec<FileRecord> {
     let mut results: Vec<_> = records
         .iter()
         .filter(|record| record_matches_scoped(record, search, selected, include_tags))
         .cloned()
         .collect();
-    results.sort_by_key(|record| record_search_sort_key_scoped(record, search, include_tags));
-    sort_records(&mut results, sort);
+    results.sort_by(|left, right| {
+        let left_imported = record_is_recently_imported(left, recent_import_paths);
+        let right_imported = record_is_recently_imported(right, recent_import_paths);
+        right_imported
+            .cmp(&left_imported)
+            .then_with(|| {
+                search_priority_key(left, search, include_tags).cmp(&search_priority_key(
+                    right,
+                    search,
+                    include_tags,
+                ))
+            })
+            .then_with(|| compare_sort_values(left, right, sort))
+    });
     results
 }
 
+fn search_priority_key(
+    record: &FileRecord,
+    search: &str,
+    include_tags: bool,
+) -> (u8, usize, usize) {
+    let (class, span, start, _, _) = record_search_sort_key_scoped(record, search, include_tags);
+    (class, span, start)
+}
+
+fn record_is_recently_imported(
+    record: &FileRecord,
+    recent_import_paths: &BTreeSet<PathBuf>,
+) -> bool {
+    record
+        .variants
+        .iter()
+        .any(|variant| recent_import_paths.contains(&variant.path))
+}
+
 fn sort_records(records: &mut [FileRecord], sort: &SortState) {
+    records.sort_by(|left, right| compare_sort_values(left, right, sort));
+}
+
+fn compare_sort_values(left: &FileRecord, right: &FileRecord, sort: &SortState) -> Ordering {
     let Some(column) = sort.column.as_ref() else {
-        return;
+        return Ordering::Equal;
     };
 
-    records.sort_by(|left, right| {
-        let left_value = sort_value(left, column);
-        let right_value = sort_value(right, column);
-        let primary = left_value.to_lowercase().cmp(&right_value.to_lowercase());
-        let primary = if sort.direction == SortDirection::Descending {
-            primary.reverse()
-        } else {
-            primary
-        };
+    let left_value = sort_value(left, column);
+    let right_value = sort_value(right, column);
+    let primary = left_value.to_lowercase().cmp(&right_value.to_lowercase());
+    let primary = if sort.direction == SortDirection::Descending {
+        primary.reverse()
+    } else {
         primary
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.path.cmp(&right.path))
-    });
+    };
+    primary
+        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.path.cmp(&right.path))
 }
 
 fn sort_value(record: &FileRecord, column: &SortColumn) -> String {
