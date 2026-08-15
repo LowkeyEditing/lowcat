@@ -67,6 +67,7 @@ fn sort_fixture(name: &str, tags: &[(&str, &[&str])]) -> FileRecord {
                 )
             })
             .collect(),
+        favorite: false,
     }
 }
 
@@ -150,6 +151,7 @@ fn recent_imports_are_grouped_after_existing_sort_order() {
         "",
         &BTreeMap::new(),
         false,
+        false,
         &SortState {
             column: Some(SortColumn::Name),
             direction: SortDirection::Descending,
@@ -180,6 +182,7 @@ fn search_relevance_precedes_explicit_sort_order() {
         "a",
         &BTreeMap::new(),
         false,
+        false,
         &SortState {
             column: Some(SortColumn::Name),
             direction: SortDirection::Descending,
@@ -194,6 +197,123 @@ fn search_relevance_precedes_explicit_sort_order() {
             .collect::<Vec<_>>(),
         vec!["alpha", "zebra"]
     );
+}
+
+#[test]
+fn favorites_filter_intersects_search_without_changing_order() {
+    let mut alpha = sort_fixture("alpha", &[("genre", &["Ambient"])]);
+    alpha.favorite = true;
+    let mut zulu = sort_fixture("zulu", &[("genre", &["Ambient"])]);
+    zulu.favorite = true;
+    let records = vec![sort_fixture("middle", &[]), zulu, alpha];
+    let results = filter_cached_records(
+        &records,
+        "a",
+        &BTreeMap::new(),
+        true,
+        true,
+        &SortState {
+            column: Some(SortColumn::Name),
+            direction: SortDirection::Ascending,
+        },
+        &BTreeSet::new(),
+    );
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "zulu"]
+    );
+}
+
+#[gpui::test]
+fn favorite_state_persists_but_filter_is_category_local_and_transient(
+    cx: &mut gpui::TestAppContext,
+) {
+    let settings_path = settings_path("favorites-restart");
+    let (music_dir, sfx_dir) = settings_with_folders(&settings_path);
+    fixture(&music_dir, "favorite.flac", &[("GENRE", "Ambient")]);
+    fixture(&music_dir, "normal.flac", &[("GENRE", "Ambient")]);
+    fixture(&sfx_dir, "impact.flac", &[("TYPE", "Impact")]);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path.clone()));
+
+    let (favorite_paths, normal_paths) = library.read_with(cx, |lib, _| {
+        let paths_for = |name: &str| {
+            lib.active_state()
+                .results
+                .iter()
+                .find(|record| record.name == name)
+                .unwrap()
+                .variants
+                .iter()
+                .map(|variant| variant.path.clone())
+                .collect::<Vec<_>>()
+        };
+        (paths_for("favorite"), paths_for("normal"))
+    });
+    let mut mixed_paths = favorite_paths.clone();
+    mixed_paths.extend(normal_paths);
+    assert!(library.update(cx, |lib, cx| {
+        lib.toggle_favorite_paths(mixed_paths.clone(), false, cx)
+    }));
+    assert!(library.read_with(cx, |lib, _| {
+        lib.active_state()
+            .all_records
+            .iter()
+            .all(|record| record.favorite)
+    }));
+    assert!(library.update(cx, |lib, cx| {
+        lib.toggle_favorite_paths(mixed_paths, true, cx)
+    }));
+    assert!(library.read_with(cx, |lib, _| {
+        lib.active_state()
+            .all_records
+            .iter()
+            .all(|record| !record.favorite)
+    }));
+    assert!(library.update(cx, |lib, cx| {
+        lib.toggle_favorite_paths(favorite_paths, false, cx)
+    }));
+    library.update(cx, |lib, cx| {
+        lib.toggle_filters(cx);
+        lib.toggle_value("genre", "Ambient", cx);
+        lib.set_search("favorite".to_string(), cx);
+        lib.toggle_favorites_filter(cx);
+    });
+    let (favorite_only, names) = library.read_with(cx, |lib, _| {
+        (
+            lib.favorites_only(),
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert!(favorite_only);
+    assert_eq!(names, vec!["favorite"]);
+
+    library.update(cx, |lib, cx| lib.set_category(Category::Sfx, cx));
+    assert!(!library.read_with(cx, |lib, _| lib.favorites_only()));
+    library.update(cx, |lib, cx| lib.toggle_favorites_filter(cx));
+    library.update(cx, |lib, cx| lib.set_category(Category::Music, cx));
+    assert!(library.read_with(cx, |lib, _| lib.favorites_only()));
+
+    let restarted = cx.new(|_| Library::new_with_settings_path(settings_path));
+    let (favorite_only, favorite) = restarted.read_with(cx, |lib, _| {
+        (
+            lib.favorites_only(),
+            lib.active_state()
+                .all_records
+                .iter()
+                .find(|record| record.name == "favorite")
+                .is_some_and(|record| record.favorite),
+        )
+    });
+    assert!(!favorite_only);
+    assert!(favorite);
 }
 
 #[gpui::test]

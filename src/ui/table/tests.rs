@@ -160,3 +160,54 @@ fn pointer_boundary_accepts_interior_and_rejects_zero_sized_window() {
         size(px(0.), px(0.))
     ));
 }
+
+#[test]
+fn favorite_target_uses_all_favorite_rule_and_every_variant_path() {
+    let record = |name: &str, favorite: bool| FileRecord {
+        name: name.to_string(),
+        path: PathBuf::from(format!("/tmp/{name}.wav")),
+        support: crate::model::FileSupport::Native,
+        stem: name.to_string(),
+        variants: vec![crate::model::FileVariant {
+            path: PathBuf::from(format!("/tmp/{name}.wav")),
+            extension: "wav".to_string(),
+            size: 0,
+            modified: 0,
+            first_seen_at: 0,
+            waveform: None,
+            trim: None,
+            trim_artifact_path: None,
+            trim_artifact_state: None,
+        }],
+        tags: BTreeMap::new(),
+        favorite,
+    };
+    let mut favorite = record("favorite", true);
+    favorite.variants.push(crate::model::FileVariant {
+        path: PathBuf::from("/tmp/favorite.flac"),
+        extension: "flac".to_string(),
+        size: 0,
+        modified: 0,
+        first_seen_at: 0,
+        waveform: None,
+        trim: None,
+        trim_artifact_path: None,
+        trim_artifact_state: None,
+    });
+    let normal = record("normal", false);
+
+    let mixed = FileTable::favorite_target(&[&favorite, &normal]);
+    assert!(!mixed.all_favorite);
+    assert_eq!(mixed.paths.len(), 3);
+
+    let all_favorite = FileTable::favorite_target(&[&favorite]);
+    assert!(all_favorite.all_favorite);
+    assert_eq!(all_favorite.paths.len(), 2);
+}
+
+#[test]
+fn favorite_row_remains_highlighted_with_favorites_filter() {
+    assert!(favorite_row_highlighted(true, false));
+    assert!(favorite_row_highlighted(true, true));
+    assert!(!favorite_row_highlighted(false, false));
+}

@@ -30,7 +30,7 @@ use gpui_platform::application;
 use crate::library::Library;
 use crate::ui::{
     AssignFolderTags, ClearFilterTags, ClearFilterTagsAndSearch, NextCategory, PreviousCategory,
-    RenameSelection, ToggleDownloader, ToggleFilters, ToggleSettings, UI,
+    RenameSelection, ToggleDownloader, ToggleFavoriteSelection, ToggleFilters, ToggleSettings, UI,
 };
 
 actions!(
@@ -82,6 +82,7 @@ fn main() {
             KeyBinding::new("cmd-e", ToggleFilters, None),
             KeyBinding::new("cmd-i", AssignFolderTags, None),
             KeyBinding::new("f2", RenameSelection, None),
+            KeyBinding::new("cmd-d", ToggleFavoriteSelection, None),
             KeyBinding::new("shift-delete", ClearFilterTags, None),
             KeyBinding::new("shift-backspace", ClearFilterTags, None),
             KeyBinding::new("cmd-shift-delete", ClearFilterTagsAndSearch, None),

@@ -75,6 +75,8 @@ impl FileTable {
         let path = record.path.clone();
         let convertible = record.is_convertible();
         let recently_imported = self.library.read(cx).record_is_recently_imported(record);
+        let favorite_highlighted =
+            favorite_row_highlighted(record.favorite, self.library.read(cx).favorites_only());
         let selected = self.selected.contains(path.as_path());
         let preview_active = self.preview_active_row.as_ref() == Some(&path);
         let waveform = record.primary_waveform().copied();
@@ -112,6 +114,7 @@ impl FileTable {
         };
         let convertible_bg = hsla(0.095, 1., 0.55, 0.12);
         let recently_imported_bg = cx.theme().success.opacity(0.14);
+        let favorite_bg = cx.theme().warning.opacity(0.14);
         let chip_delete_bg = red().opacity(0.18);
         let row_delete_bg = red().opacity(0.18);
         let format_chip_hovered = self.hovered_format_chip.as_ref().is_some_and(|hovered| {
@@ -140,6 +143,9 @@ impl FileTable {
         let conversion_actions = multi_selection
             .map(|actions| actions.conversion_actions.clone())
             .unwrap_or_else(|| Self::record_conversion_actions(record));
+        let favorite_target = multi_selection
+            .map(|actions| actions.favorite_target.clone())
+            .unwrap_or_else(|| Arc::new(Self::favorite_target(&[record])));
         let table = cx.entity();
         let row_drag_paths = multi_selection
             .map(|actions| actions.row_drag_paths.clone())
@@ -165,6 +171,7 @@ impl FileTable {
                 s.border_t_1().border_color(cx.theme().table_row_border)
             })
             .when(convertible, |s| s.bg(convertible_bg))
+            .when(favorite_highlighted, |s| s.bg(favorite_bg))
             .when(recently_imported, |s| s.bg(recently_imported_bg))
             .when(selected || row_hovered, |s| s.bg(row_hover_bg))
             .when(delete_hovered, |s| s.bg(row_delete_bg))
@@ -225,6 +232,7 @@ impl FileTable {
             .context_menu(move |menu, window, menu_cx| {
                 let table = table_for_context_menu.clone();
                 let actions = conversion_actions.clone();
+                let favorite_target = favorite_target.clone();
                 let target = delete_target.clone();
                 let row_rename_target = rename_target.clone();
                 let row_count = target.row_count;
@@ -332,6 +340,31 @@ impl FileTable {
                             });
                         }));
                 }
+                let favorite_table = table.clone();
+                let favorite_label = if favorite_target.all_favorite {
+                    "Remove from Favorites"
+                } else {
+                    "Add to Favorites"
+                };
+                menu = menu
+                    .item(
+                        PopupMenuItem::new(favorite_label).on_click(move |_, _, cx| {
+                            let target = favorite_target.clone();
+                            cx.update_entity(&favorite_table, |this, cx| {
+                                let changed = this.library.update(cx, |library, cx| {
+                                    library.toggle_favorite_paths(
+                                        target.paths.clone(),
+                                        target.all_favorite,
+                                        cx,
+                                    )
+                                });
+                                if changed {
+                                    this.invalidate_selected_rows_actions();
+                                }
+                            });
+                        }),
+                    )
+                    .separator();
                 for action in actions.iter().cloned() {
                     let table = table.clone();
                     let target = action.target;

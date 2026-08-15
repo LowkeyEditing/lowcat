@@ -297,6 +297,7 @@ impl Render for Toolbar {
         }
 
         let downloader_open = self.library.read(cx).downloader_open();
+        let favorites_only = self.library.read(cx).favorites_only();
         let filter_button = Button::new("filter-toggle")
             .icon(IconName::Settings2)
             .small()
@@ -313,6 +314,19 @@ impl Render for Toolbar {
             .selected(downloader_open)
             .on_click(cx.listener(|this, _, _, cx| {
                 this.library.update(cx, |lib, cx| lib.toggle_downloader(cx));
+            }));
+        let favorites_button = Button::new("favorites-toggle")
+            .icon(IconName::Star)
+            .small()
+            .tooltip(if favorites_only {
+                "Show all rows"
+            } else {
+                "Show favorites"
+            })
+            .when(favorites_only, |button| button.warning())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.library
+                    .update(cx, |lib, cx| lib.toggle_favorites_filter(cx));
             }));
         let clear_filter_tags_button = (chips_len > 0).then(|| {
             Button::new("clear-filter-tags")
@@ -341,6 +355,7 @@ impl Render for Toolbar {
                 toolbar.child(button)
             })
             .child(chip_row)
+            .child(favorites_button)
             .child(search);
 
         crate::perf::finish("toolbar.render", render_start, || {

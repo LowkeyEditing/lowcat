@@ -58,6 +58,10 @@ const CONVERT_MENU_PANE_WIDTH: f32 = 160.;
 const ROW_HEIGHT: Pixels = px(32.);
 const TRIM_DRAG_THRESHOLD_PX: f32 = 4.;
 
+fn favorite_row_highlighted(favorite: bool, _favorites_only: bool) -> bool {
+    favorite
+}
+
 #[derive(Clone)]
 pub(super) struct InternalFileDrag {
     data: Arc<Mutex<InternalFileDragData>>,
@@ -199,6 +203,7 @@ struct SelectedRowsActions {
     conversion_actions: Arc<Vec<ConversionAction>>,
     row_drag_paths: Arc<Vec<PathBuf>>,
     format_drag_paths: BTreeMap<String, Arc<Vec<PathBuf>>>,
+    favorite_target: Arc<FavoriteTarget>,
 }
 
 struct SelectedRowsActionsCache {
@@ -210,6 +215,12 @@ struct SelectedRowsActionsCache {
 struct ConversionAction {
     target: AudioFormat,
     sources: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FavoriteTarget {
+    paths: Vec<PathBuf>,
+    all_favorite: bool,
 }
 
 #[derive(Clone)]
@@ -1696,6 +1707,18 @@ impl FileTable {
         })
     }
 
+    fn favorite_target(records: &[&FileRecord]) -> FavoriteTarget {
+        let mut seen = BTreeSet::new();
+        FavoriteTarget {
+            paths: records
+                .iter()
+                .flat_map(|record| record.variants.iter().map(|variant| variant.path.clone()))
+                .filter(|path| seen.insert(path.clone()))
+                .collect(),
+            all_favorite: !records.is_empty() && records.iter().all(|record| record.favorite),
+        }
+    }
+
     fn selected_rows_actions(records: &[&FileRecord]) -> Arc<SelectedRowsActions> {
         let row_drag_paths = Arc::new(records.iter().map(|record| record.path.clone()).collect());
         let mut seen = BTreeSet::new();
@@ -1752,6 +1775,7 @@ impl FileTable {
                 (extension, paths)
             })
             .collect();
+        let favorite_target = Arc::new(Self::favorite_target(records));
 
         Arc::new(SelectedRowsActions {
             delete_target,
@@ -1759,6 +1783,7 @@ impl FileTable {
             conversion_actions,
             row_drag_paths,
             format_drag_paths,
+            favorite_target,
         })
     }
 
@@ -2128,6 +2153,30 @@ impl FileTable {
         cx.notify();
         debug_table_interaction(|| format!("select all visible rows={}", self.selected.len()));
         true
+    }
+
+    pub fn toggle_selected_favorites(&mut self, cx: &mut Context<Self>) -> bool {
+        let target = {
+            let library = self.library.read(cx);
+            let records: Vec<_> = library
+                .active_state()
+                .results
+                .iter()
+                .filter(|record| self.selected.contains(record.path.as_path()))
+                .collect();
+            Self::favorite_target(&records)
+        };
+        if target.paths.is_empty() {
+            return false;
+        }
+        let changed = self.library.update(cx, |library, cx| {
+            library.toggle_favorite_paths(target.paths, target.all_favorite, cx)
+        });
+        if changed {
+            self.invalidate_selected_rows_actions();
+            cx.notify();
+        }
+        changed
     }
 
     pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {

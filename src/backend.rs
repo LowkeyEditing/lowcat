@@ -201,6 +201,7 @@ impl Backend {
         new_stem: &str,
     ) -> io::Result<usize> {
         let renamed = rename_record_files(records, new_stem)?;
+        self.db.transfer_favorites(&renamed)?;
         for (source, destination) in &renamed {
             self.transfer_trim(source, destination)?;
         }
@@ -305,6 +306,10 @@ impl Backend {
         behavior: ConvertConflictBehavior,
     ) -> io::Result<()> {
         self.db.set_convert_conflict_behavior(behavior)
+    }
+
+    pub fn set_favorite_paths(&self, paths: &[PathBuf], favorite: bool) -> io::Result<()> {
+        self.db.set_favorite_paths(paths, favorite)
     }
 
     pub fn convert_file_to_format(

@@ -226,6 +226,50 @@ impl Library {
         self.filters_open
     }
 
+    pub fn favorites_only(&self) -> bool {
+        self.active_state().favorites_only
+    }
+
+    pub fn toggle_favorites_filter(&mut self, cx: &mut Context<Self>) {
+        let active = self.active;
+        let state = self.states.entry(active).or_default();
+        state.favorites_only = !state.favorites_only;
+        self.clear_import_priority();
+        self.refresh_search_results(active);
+        cx.notify();
+    }
+
+    pub fn toggle_favorite_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        all_favorite: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let paths: Vec<_> = paths
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if paths.is_empty() {
+            return false;
+        }
+        let favorite = !all_favorite;
+        match self.backend.set_favorite_paths(&paths, favorite) {
+            Ok(()) => {
+                self.refresh_category_state(self.active);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                eprintln!(
+                    "lowcat favorites update failed paths={} favorite={favorite} error={error}",
+                    paths.len()
+                );
+                false
+            }
+        }
+    }
+
     pub fn search(&self) -> &str {
         &self.active_state().search
     }
@@ -441,9 +485,13 @@ impl Library {
         self.set_search_query(&search);
         let category = self.active;
         let source_revision = self.table_revision;
-        let (records, selected) = {
+        let (records, selected, favorites_only) = {
             let state = &self.states[&category];
-            (state.all_records.clone(), state.selected.clone())
+            (
+                state.all_records.clone(),
+                state.selected.clone(),
+                state.favorites_only,
+            )
         };
         let include_tags = self.filters_open;
         let sort = self.states[&category].sort.clone();
@@ -456,6 +504,7 @@ impl Library {
                 &search_for_task,
                 &selected,
                 include_tags,
+                favorites_only,
                 &sort,
                 &recent_import_paths,
             );
@@ -1417,15 +1466,17 @@ impl Library {
         renamed_key: Option<(&str, &str)>,
     ) {
         let total_start = crate::perf::start();
-        let (search, mut selected, mut sort) = if let Some(state) = self.states.get(&category) {
-            (
-                state.search.clone(),
-                state.selected.clone(),
-                state.sort.clone(),
-            )
-        } else {
-            (String::new(), BTreeMap::new(), SortState::default())
-        };
+        let (search, mut selected, mut sort, favorites_only) =
+            if let Some(state) = self.states.get(&category) {
+                (
+                    state.search.clone(),
+                    state.selected.clone(),
+                    state.sort.clone(),
+                    state.favorites_only,
+                )
+            } else {
+                (String::new(), BTreeMap::new(), SortState::default(), false)
+            };
         let schema_start = crate::perf::start();
         let schema = display_schema(self.backend.schema_for(category));
         let all_records = display_records(
@@ -1462,6 +1513,7 @@ impl Library {
             &search,
             &selected,
             self.filters_open,
+            favorites_only,
             &sort,
             &self.recent_import_paths,
         );
@@ -1492,27 +1544,30 @@ impl Library {
 
     fn refresh_search_results(&mut self, category: Category) {
         let total_start = crate::perf::start();
-        let (search, selected, all_records, sort) = if let Some(state) = self.states.get(&category)
-        {
-            (
-                state.search.clone(),
-                state.selected.clone(),
-                state.all_records.clone(),
-                state.sort.clone(),
-            )
-        } else {
-            (
-                String::new(),
-                BTreeMap::new(),
-                Arc::default(),
-                SortState::default(),
-            )
-        };
+        let (search, selected, all_records, sort, favorites_only) =
+            if let Some(state) = self.states.get(&category) {
+                (
+                    state.search.clone(),
+                    state.selected.clone(),
+                    state.all_records.clone(),
+                    state.sort.clone(),
+                    state.favorites_only,
+                )
+            } else {
+                (
+                    String::new(),
+                    BTreeMap::new(),
+                    Arc::default(),
+                    SortState::default(),
+                    false,
+                )
+            };
         let results = filter_cached_records(
             &all_records,
             &search,
             &selected,
             self.filters_open,
+            favorites_only,
             &sort,
             &self.recent_import_paths,
         );
@@ -1636,12 +1691,14 @@ fn filter_cached_records(
     search: &str,
     selected: &BTreeMap<String, BTreeSet<String>>,
     include_tags: bool,
+    favorites_only: bool,
     sort: &SortState,
     recent_import_paths: &BTreeSet<PathBuf>,
 ) -> Vec<FileRecord> {
     let mut results: Vec<_> = records
         .iter()
         .filter(|record| record_matches_scoped(record, search, selected, include_tags))
+        .filter(|record| !favorites_only || record.favorite)
         .cloned()
         .collect();
     results.sort_by(|left, right| {
@@ -1818,6 +1875,7 @@ fn display_record(
         stem: record.stem,
         variants,
         tags: display_schema(record.tags),
+        favorite: record.favorite,
     }
 }
 

@@ -134,6 +134,7 @@ pub struct FileRecord {
     pub stem: String,
     pub variants: Vec<FileVariant>,
     pub tags: BTreeMap<String, Vec<String>>,
+    pub favorite: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +330,7 @@ pub struct CategoryState {
     pub all_records: Arc<Vec<FileRecord>>,
     pub results: Vec<FileRecord>,
     pub sort: SortState,
+    pub favorites_only: bool,
 }
 
 pub fn canonical_tag_key(key: &str) -> Option<&'static str> {
@@ -604,6 +606,7 @@ mod tests {
                 .iter()
                 .map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect()))
                 .collect(),
+            favorite: false,
         }
     }
 

@@ -13,8 +13,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use migrations::{
-    migrate_files_first_seen_at, migrate_files_preview_waveform, migrate_tag_keys, migrate_trims,
-    seed_default_tag_keys, seed_tag_keys_from_values,
+    migrate_favorites, migrate_files_first_seen_at, migrate_files_preview_waveform,
+    migrate_tag_keys, migrate_trims, seed_default_tag_keys, seed_tag_keys_from_values,
 };
 
 use crate::model::{
@@ -45,6 +45,7 @@ struct FileRow {
     trim: Option<TrimRange>,
     trim_artifact_path: Option<PathBuf>,
     trim_artifact_state: Option<TrimArtifactState>,
+    favorite: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +143,7 @@ impl Database {
             migrate_files_first_seen_at(&self.pool).await?;
             migrate_files_preview_waveform(&self.pool).await?;
             migrate_trims(&self.pool).await?;
+            migrate_favorites(&self.pool).await?;
             seed_tag_keys_from_values(&self.pool).await?;
             seed_default_tag_keys(&self.pool).await?;
 
@@ -318,6 +320,14 @@ impl Database {
             .bind(category_key)
             .execute(&mut *tx)
             .await?;
+            sqlx::query(
+                "DELETE FROM favorites
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM files WHERE files.path = favorites.path
+                 )",
+            )
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
 
             Ok::<_, sqlx::Error>(summary)
@@ -388,6 +398,7 @@ impl Database {
         let display_names = display_names_for_rows(&rows, category_folder);
         let mut grouped: BTreeMap<String, Vec<FileVariant>> = BTreeMap::new();
         let mut stems: BTreeMap<String, String> = BTreeMap::new();
+        let mut favorites = BTreeSet::new();
 
         for row in rows {
             let display_name = display_names
@@ -397,6 +408,9 @@ impl Database {
             stems
                 .entry(display_name.clone())
                 .or_insert_with(|| row.stem.clone());
+            if row.favorite {
+                favorites.insert(display_name.clone());
+            }
             grouped.entry(display_name).or_default().push(FileVariant {
                 path: row.path,
                 extension: row.extension,
@@ -419,6 +433,7 @@ impl Database {
                 .unwrap_or_default();
             let stem = stems.remove(&name).unwrap_or_else(|| name.clone());
             let tags = tags.get(&stem).cloned().unwrap_or_default();
+            let favorite = favorites.contains(&name);
             let record = FileRecord {
                 name,
                 path,
@@ -426,6 +441,7 @@ impl Database {
                 stem,
                 variants,
                 tags,
+                favorite,
             };
             if record_matches_scoped(&record, search, &selected, include_tags) {
                 records.push(record);
@@ -770,13 +786,62 @@ impl Database {
         self.set_setting(CONVERT_CONFLICT_KEY, behavior.key())
     }
 
+    pub fn set_favorite_paths(&self, paths: &[PathBuf], favorite: bool) -> io::Result<()> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            for path in paths {
+                let path = path.to_string_lossy();
+                if favorite {
+                    sqlx::query("INSERT OR IGNORE INTO favorites(path) VALUES (?)")
+                        .bind(path.as_ref())
+                        .execute(&mut *tx)
+                        .await?;
+                } else {
+                    sqlx::query("DELETE FROM favorites WHERE path = ?")
+                        .bind(path.as_ref())
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
+    pub fn transfer_favorites(&self, renamed: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            for (source, destination) in renamed {
+                let source = source.to_string_lossy();
+                let destination = destination.to_string_lossy();
+                sqlx::query(
+                    "INSERT OR IGNORE INTO favorites(path)
+                     SELECT ? WHERE EXISTS (SELECT 1 FROM favorites WHERE path = ?)",
+                )
+                .bind(destination.as_ref())
+                .bind(source.as_ref())
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM favorites WHERE path = ?")
+                    .bind(source.as_ref())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
     fn file_rows(&self, category: Category) -> io::Result<Vec<sqlx::sqlite::SqliteRow>> {
         block_on(async {
             sqlx::query(
                 "SELECT f.path, f.stem, f.extension, f.size, f.modified, f.first_seen_at,
                         f.preview_waveform, t.start_ratio, t.end_ratio, t.artifact_path,
                         t.source_size, t.source_modified, t.artifact_start_ratio,
-                        t.artifact_end_ratio
+                        t.artifact_end_ratio,
+                        EXISTS (SELECT 1 FROM favorites fav WHERE fav.path = f.path) AS favorite
                  FROM files f
                  LEFT JOIN trims t ON t.source_path = f.path
                  WHERE f.category = ?
@@ -877,7 +942,8 @@ impl Database {
                 "SELECT f.path, f.stem, f.extension, f.size, f.modified, f.first_seen_at,
                         f.preview_waveform, t.start_ratio, t.end_ratio, t.artifact_path,
                         t.source_size, t.source_modified, t.artifact_start_ratio,
-                        t.artifact_end_ratio
+                        t.artifact_end_ratio,
+                        EXISTS (SELECT 1 FROM favorites fav WHERE fav.path = f.path) AS favorite
                  FROM files f
                  LEFT JOIN trims t ON t.source_path = f.path
                  WHERE f.category = ? AND f.stem IN ({placeholders})
@@ -1112,6 +1178,7 @@ fn file_row_from_sql(row: sqlx::sqlite::SqliteRow) -> FileRow {
         trim,
         trim_artifact_path,
         trim_artifact_state,
+        favorite: row.get::<i64, _>("favorite") != 0,
     }
 }
 

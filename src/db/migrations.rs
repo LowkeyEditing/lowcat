@@ -68,6 +68,17 @@ pub(super) async fn migrate_trims(pool: &SqlitePool) -> Result<(), sqlx::Error> 
     Ok(())
 }
 
+pub(super) async fn migrate_favorites(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS favorites (
+            path TEXT NOT NULL PRIMARY KEY
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub(super) async fn migrate_tag_keys(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     if has_column(pool, "tag_keys", "category").await? {
         return Ok(());

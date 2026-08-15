@@ -62,6 +62,113 @@ fn waveform(value: u8) -> WaveformBinary256 {
 }
 
 #[test]
+fn favorites_persist_group_variants_and_prune_removed_paths() {
+    let db_file = db_path("favorites-persist");
+    let wav = PathBuf::from("/tmp/favorite-song.wav");
+    let flac = PathBuf::from("/tmp/favorite-song.flac");
+    {
+        let db = Database::open(&db_file).unwrap();
+        db.sync_category(
+            Category::Music,
+            vec![
+                scan_path(wav.to_str().unwrap()),
+                scan_path(flac.to_str().unwrap()),
+            ],
+        )
+        .unwrap();
+        db.set_favorite_paths(std::slice::from_ref(&wav), true)
+            .unwrap();
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].favorite);
+    }
+
+    let reopened = Database::open(&db_file).unwrap();
+    let rows = reopened
+        .query_visible_rows(
+            Category::Music,
+            "",
+            &BTreeMap::new(),
+            &default_format_priority(),
+            None,
+        )
+        .unwrap();
+    assert!(rows[0].favorite);
+
+    reopened
+        .sync_category(Category::Music, vec![scan_path(flac.to_str().unwrap())])
+        .unwrap();
+    let rows = reopened
+        .query_visible_rows(
+            Category::Music,
+            "",
+            &BTreeMap::new(),
+            &default_format_priority(),
+            None,
+        )
+        .unwrap();
+    assert!(!rows[0].favorite);
+
+    reopened
+        .sync_category(
+            Category::Music,
+            vec![
+                scan_path(wav.to_str().unwrap()),
+                scan_path(flac.to_str().unwrap()),
+            ],
+        )
+        .unwrap();
+    let rows = reopened
+        .query_visible_rows(
+            Category::Music,
+            "",
+            &BTreeMap::new(),
+            &default_format_priority(),
+            None,
+        )
+        .unwrap();
+    assert!(!rows[0].favorite);
+}
+
+#[test]
+fn duplicate_name_rows_have_independent_favorites() {
+    let db = Database::open(&db_path("favorite-duplicates")).unwrap();
+    let first = PathBuf::from("/tmp/one/duplicate.wav");
+    let second = PathBuf::from("/tmp/two/duplicate.wav");
+    db.sync_category(
+        Category::Music,
+        vec![
+            scan_path(first.to_str().unwrap()),
+            scan_path(second.to_str().unwrap()),
+        ],
+    )
+    .unwrap();
+    db.set_favorite_paths(std::slice::from_ref(&second), true)
+        .unwrap();
+
+    let rows = db
+        .query_visible_rows(
+            Category::Music,
+            "",
+            &BTreeMap::new(),
+            &default_format_priority(),
+            Some(Path::new("/tmp")),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.iter().filter(|row| row.favorite).count(), 1);
+    assert_eq!(rows.iter().find(|row| row.favorite).unwrap().path, second);
+}
+
+#[test]
 fn trim_range_round_trips_after_database_reopen() {
     let path = db_path("trim-restart");
     let source = PathBuf::from("/tmp/restart-trim.wav");

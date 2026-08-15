@@ -32,7 +32,8 @@ actions!(
         ClearFilterTags,
         ClearFilterTagsAndSearch,
         AssignFolderTags,
-        RenameSelection
+        RenameSelection,
+        ToggleFavoriteSelection
     ]
 );
 
@@ -428,6 +429,14 @@ impl Render for UI {
                 }
                 this.table.update(cx, |table, cx| {
                     table.start_selected_rename(window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ToggleFavoriteSelection, _, cx| {
+                if this.has_media_tool_problems() {
+                    return;
+                }
+                this.table.update(cx, |table, cx| {
+                    table.toggle_selected_favorites(cx);
                 });
             }))
             .on_action(cx.listener(|this, _: &NextCategory, _, cx| {
