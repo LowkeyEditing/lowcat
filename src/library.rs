@@ -12,8 +12,9 @@ use crate::backend::{
 use crate::downloader::{DownloadCancel, DownloadState};
 use crate::model::{
     AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
-    TrimArtifactState, TrimRange, default_format_priority, fuzzy_search_match, normalize_tag_key,
-    record_matches_scoped, record_search_sort_key_scoped, tag_label,
+    SortColumn, SortDirection, SortState, TrimArtifactState, TrimRange, default_format_priority,
+    fuzzy_search_match, normalize_tag_key, record_matches_scoped, record_search_sort_key_scoped,
+    tag_label,
 };
 use crate::preview_player::{PreviewPlayer, PreviewPosition};
 
@@ -226,6 +227,26 @@ impl Library {
         &self.active_state().search
     }
 
+    pub fn sort_state(&self) -> &SortState {
+        &self.active_state().sort
+    }
+
+    pub fn toggle_sort(&mut self, column: SortColumn, cx: &mut Context<Self>) {
+        let column = match column {
+            SortColumn::Name => SortColumn::Name,
+            SortColumn::Tag(key) => SortColumn::Tag(display_tag_key(&key).unwrap_or(key)),
+        };
+        let state = self.states.entry(self.active).or_default();
+        if state.sort.column.as_ref() == Some(&column) {
+            state.sort.direction = state.sort.direction.toggled();
+        } else {
+            state.sort.column = Some(column);
+            state.sort.direction = SortDirection::Ascending;
+        }
+        self.refresh_search_results(self.active);
+        cx.notify();
+    }
+
     pub(crate) fn table_revision(&self) -> u64 {
         self.table_revision
     }
@@ -399,11 +420,12 @@ impl Library {
             (state.all_records.clone(), state.selected.clone())
         };
         let include_tags = self.filters_open;
+        let sort = self.states[&category].sort.clone();
         let search_for_task = search.clone();
         let task = cx.background_spawn(async move {
             let start = crate::perf::start();
             let results =
-                filter_cached_records(&records, &search_for_task, &selected, include_tags);
+                filter_cached_records(&records, &search_for_task, &selected, include_tags, &sort);
             crate::perf::finish("library.search.background", start, || {
                 format!(
                     "results={} search_len={} selected_keys={}",
@@ -1349,10 +1371,14 @@ impl Library {
         renamed_key: Option<(&str, &str)>,
     ) {
         let total_start = crate::perf::start();
-        let (search, mut selected) = if let Some(state) = self.states.get(&category) {
-            (state.search.clone(), state.selected.clone())
+        let (search, mut selected, mut sort) = if let Some(state) = self.states.get(&category) {
+            (
+                state.search.clone(),
+                state.selected.clone(),
+                state.sort.clone(),
+            )
         } else {
-            (String::new(), BTreeMap::new())
+            (String::new(), BTreeMap::new(), SortState::default())
         };
         let schema_start = crate::perf::start();
         let schema = display_schema(self.backend.schema_for(category));
@@ -1383,8 +1409,10 @@ impl Library {
         });
         reconcile_selected_filter_keys(&mut selected, &schema, renamed_key);
         reconcile_selected_filters(&mut selected, &schema, renamed_tag);
+        reconcile_sort_state(&mut sort, &schema, renamed_key);
         let filter_start = crate::perf::start();
-        let results = filter_cached_records(&all_records, &search, &selected, self.filters_open);
+        let results =
+            filter_cached_records(&all_records, &search, &selected, self.filters_open, &sort);
         crate::perf::finish("library.filter", filter_start, || {
             format!(
                 "category={} results={} search_len={} selected_keys={}",
@@ -1399,6 +1427,7 @@ impl Library {
         state.schema = schema;
         state.all_records = Arc::new(all_records);
         state.results = results;
+        state.sort = sort;
         crate::perf::finish("library.refresh_category_state", total_start, || {
             format!(
                 "category={} results={}",
@@ -1411,16 +1440,24 @@ impl Library {
 
     fn refresh_search_results(&mut self, category: Category) {
         let total_start = crate::perf::start();
-        let (search, selected, all_records) = if let Some(state) = self.states.get(&category) {
+        let (search, selected, all_records, sort) = if let Some(state) = self.states.get(&category)
+        {
             (
                 state.search.clone(),
                 state.selected.clone(),
                 state.all_records.clone(),
+                state.sort.clone(),
             )
         } else {
-            (String::new(), BTreeMap::new(), Arc::default())
+            (
+                String::new(),
+                BTreeMap::new(),
+                Arc::default(),
+                SortState::default(),
+            )
         };
-        let results = filter_cached_records(&all_records, &search, &selected, self.filters_open);
+        let results =
+            filter_cached_records(&all_records, &search, &selected, self.filters_open, &sort);
         let results_len = results.len();
         self.states.entry(category).or_default().results = results;
         self.bump_results_revision();
@@ -1526,6 +1563,7 @@ fn filter_cached_records(
     search: &str,
     selected: &BTreeMap<String, BTreeSet<String>>,
     include_tags: bool,
+    sort: &SortState,
 ) -> Vec<FileRecord> {
     let mut results: Vec<_> = records
         .iter()
@@ -1533,7 +1571,63 @@ fn filter_cached_records(
         .cloned()
         .collect();
     results.sort_by_key(|record| record_search_sort_key_scoped(record, search, include_tags));
+    sort_records(&mut results, sort);
     results
+}
+
+fn sort_records(records: &mut [FileRecord], sort: &SortState) {
+    let Some(column) = sort.column.as_ref() else {
+        return;
+    };
+
+    records.sort_by(|left, right| {
+        let left_value = sort_value(left, column);
+        let right_value = sort_value(right, column);
+        let primary = left_value.to_lowercase().cmp(&right_value.to_lowercase());
+        let primary = if sort.direction == SortDirection::Descending {
+            primary.reverse()
+        } else {
+            primary
+        };
+        primary
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+}
+
+fn sort_value(record: &FileRecord, column: &SortColumn) -> String {
+    match column {
+        SortColumn::Name => record.name.clone(),
+        SortColumn::Tag(key) => record
+            .tags
+            .iter()
+            .find(|(record_key, _)| record_key.eq_ignore_ascii_case(key))
+            .map(|(_, values)| values.join(" "))
+            .unwrap_or_default(),
+    }
+}
+
+fn reconcile_sort_state(
+    sort: &mut SortState,
+    schema: &BTreeMap<String, Vec<String>>,
+    renamed_key: Option<(&str, &str)>,
+) {
+    if let Some((old_key, new_key)) = renamed_key
+        && let Some(SortColumn::Tag(key)) = sort.column.as_mut()
+        && key.eq_ignore_ascii_case(old_key)
+    {
+        *key = display_tag_key(new_key).unwrap_or_else(|| new_key.to_string());
+    }
+
+    if let Some(SortColumn::Tag(key)) = sort.column.as_ref()
+        && !schema
+            .keys()
+            .any(|schema_key| schema_key.eq_ignore_ascii_case(key))
+    {
+        sort.column = None;
+        sort.direction = SortDirection::Ascending;
+    }
 }
 
 fn database_path_for_settings(settings_path: &Path) -> PathBuf {

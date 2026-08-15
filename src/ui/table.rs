@@ -39,8 +39,8 @@ use crate::{
     backend::RenameRecord,
     library::{Library, LibraryEvent},
     model::{
-        AudioFormat, Category, FileRecord, TrimArtifactState, TrimRange, WAVEFORM_BAR_COUNT,
-        WaveformBinary256,
+        AudioFormat, Category, FileRecord, SortColumn, SortDirection, TrimArtifactState, TrimRange,
+        WAVEFORM_BAR_COUNT, WaveformBinary256,
     },
 };
 
@@ -53,6 +53,7 @@ const TAG_TEXT_WIDTH: f32 = 7.;
 const TAG_EDITOR_WIDTH: f32 = 90.;
 const TAG_KEY_ACTION_WIDTH: f32 = 32.;
 const TAG_KEY_EDITOR_WIDTH: f32 = 118.;
+const TAG_SORT_INDICATOR_WIDTH: f32 = 20.;
 const CONVERT_MENU_PANE_WIDTH: f32 = 160.;
 const ROW_HEIGHT: Pixels = px(32.);
 const TRIM_DRAG_THRESHOLD_PX: f32 = 4.;
@@ -607,7 +608,7 @@ impl FileTable {
             None,
         );
 
-        shaped.width.as_f32() + TAG_CELL_LEFT_PADDING_WIDTH
+        shaped.width.as_f32() + TAG_CELL_LEFT_PADDING_WIDTH + TAG_SORT_INDICATOR_WIDTH
     }
 
     fn tag_column_width(

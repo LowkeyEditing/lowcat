@@ -796,16 +796,46 @@ impl Render for FileTable {
             px(TAG_KEY_ACTION_WIDTH)
         };
         let tag_column_keys = self.tag_column_keys(cx);
+        let active_sort = self.library.read(cx).sort_state().clone();
+        let name_is_sorted = active_sort.column == Some(SortColumn::Name);
 
         let mut header_row = TableRow::new().child(
             TableHead::new().flex_1().min_w_0().px(CONTENT_PX).child(
                 div()
+                    .id("name-header")
                     .h_full()
                     .w_full()
                     .min_w_0()
                     .h_flex()
                     .items_center()
-                    .child(div().flex_none().max_w_full().truncate().child("name"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.library.update(cx, |library, cx| {
+                                library.toggle_sort(SortColumn::Name, cx);
+                            });
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_1()
+                            .flex_shrink(1.)
+                            .min_w_0()
+                            .cursor_pointer()
+                            .child("name")
+                            .when(name_is_sorted, |header| {
+                                header.child(
+                                    Icon::new(match active_sort.direction {
+                                        SortDirection::Ascending => IconName::ArrowUp,
+                                        SortDirection::Descending => IconName::ArrowDown,
+                                    })
+                                    .small(),
+                                )
+                            }),
+                    )
                     .child(div().h_full().flex_1().min_w_0().on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -817,16 +847,20 @@ impl Render for FileTable {
         );
         for (key, tag_width) in keys.iter().zip(&tag_widths) {
             let key_for_click = key.clone();
+            let key_for_header = key.clone();
             let key_for_menu = key.clone();
             let key_for_hover = key.clone();
             let key_is_delete_hovered = self.alt_down && self.hovered_tag_key.as_ref() == Some(key);
+            let tag_is_sorted = active_sort.column == Some(SortColumn::Tag(key.clone()));
             let table = cx.entity();
             let table_for_label_menu = table.clone();
             let header_label = div()
                 .id(SharedString::from(format!("tag-key-header:{key}")))
+                .h_flex()
+                .items_center()
+                .gap_1()
                 .flex_none()
-                .max_w_full()
-                .truncate()
+                .min_w_0()
                 .cursor_pointer()
                 .text_color(cx.theme().foreground)
                 .when(key_is_delete_hovered, |el| el.text_color(red()))
@@ -869,7 +903,22 @@ impl Render for FileTable {
                         }),
                     )
                 })
-                .child(SharedString::from(key.clone()))
+                .child(
+                    div()
+                        .flex_shrink(1.)
+                        .min_w_0()
+                        .truncate()
+                        .child(SharedString::from(key.clone())),
+                )
+                .when(tag_is_sorted, |header| {
+                    header.child(
+                        Icon::new(match active_sort.direction {
+                            SortDirection::Ascending => IconName::ArrowUp,
+                            SortDirection::Descending => IconName::ArrowDown,
+                        })
+                        .small(),
+                    )
+                })
                 .into_any_element();
             header_row = header_row.child(
                 TableHead::new()
@@ -880,11 +929,26 @@ impl Render for FileTable {
                     .pr(px(0.))
                     .child(
                         div()
+                            .id(SharedString::from(format!(
+                                "tag-key-header-container:{key}"
+                            )))
                             .h_full()
                             .w_full()
                             .min_w_0()
                             .h_flex()
                             .items_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    this.library.update(cx, |library, cx| {
+                                        library.toggle_sort(
+                                            SortColumn::Tag(key_for_header.clone()),
+                                            cx,
+                                        );
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .child(header_label)
                             .child(div().h_full().flex_1().min_w_0().on_mouse_down(
                                 MouseButton::Right,

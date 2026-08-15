@@ -49,6 +49,42 @@ pub enum Category {
     Sfx,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortColumn {
+    Name,
+    Tag(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortState {
+    pub column: Option<SortColumn>,
+    pub direction: SortDirection,
+}
+
+impl Default for SortState {
+    fn default() -> Self {
+        Self {
+            column: None,
+            direction: SortDirection::Ascending,
+        }
+    }
+}
+
 impl Category {
     pub const ALL: [Category; 2] = [Category::Music, Category::Sfx];
 
@@ -292,6 +328,7 @@ pub struct CategoryState {
     pub search: String,
     pub all_records: Arc<Vec<FileRecord>>,
     pub results: Vec<FileRecord>,
+    pub sort: SortState,
 }
 
 pub fn canonical_tag_key(key: &str) -> Option<&'static str> {

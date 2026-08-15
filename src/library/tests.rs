@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::{FileSupport, FileVariant};
 use std::fs;
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -38,6 +39,237 @@ fn settings_with_folders(path: &Path) -> (PathBuf, PathBuf) {
     settings.set_category_folder(Category::Sfx, sfx_dir.clone());
     settings.save(path).unwrap();
     (music_dir, sfx_dir)
+}
+
+fn sort_fixture(name: &str, tags: &[(&str, &[&str])]) -> FileRecord {
+    FileRecord {
+        name: name.to_string(),
+        path: PathBuf::from(format!("/tmp/{name}")),
+        support: FileSupport::Native,
+        stem: name.to_string(),
+        variants: vec![FileVariant {
+            path: PathBuf::from(format!("/tmp/{name}")),
+            extension: "wav".to_string(),
+            size: 0,
+            modified: 0,
+            first_seen_at: 0,
+            waveform: None,
+            trim: None,
+            trim_artifact_path: None,
+            trim_artifact_state: None,
+        }],
+        tags: tags
+            .iter()
+            .map(|(key, values)| {
+                (
+                    (*key).to_string(),
+                    values.iter().map(|value| (*value).to_string()).collect(),
+                )
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn sort_comparison_handles_case_ties_missing_and_multi_value_tags() {
+    let mut records = vec![
+        sort_fixture("beta", &[("GENRE", &["Zulu", "Alpha"])]),
+        sort_fixture("Alpha", &[("genre", &["alpha"])]),
+        sort_fixture("alpha", &[]),
+        sort_fixture("aardvark", &[("genre", &["Alpha"])]),
+    ];
+
+    sort_records(
+        &mut records,
+        &SortState {
+            column: Some(SortColumn::Name),
+            direction: SortDirection::Ascending,
+        },
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aardvark", "Alpha", "alpha", "beta"]
+    );
+
+    sort_records(
+        &mut records,
+        &SortState {
+            column: Some(SortColumn::Tag("genre".to_string())),
+            direction: SortDirection::Ascending,
+        },
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "aardvark", "Alpha", "beta"]
+    );
+
+    sort_records(
+        &mut records,
+        &SortState {
+            column: Some(SortColumn::Tag("genre".to_string())),
+            direction: SortDirection::Descending,
+        },
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["beta", "aardvark", "Alpha", "alpha"]
+    );
+}
+
+#[test]
+fn removed_and_renamed_tag_sort_columns_reconcile_with_schema() {
+    let mut sort = SortState {
+        column: Some(SortColumn::Tag("genre".to_string())),
+        direction: SortDirection::Descending,
+    };
+    let mut schema = BTreeMap::from([(String::from("mood"), Vec::<String>::new())]);
+    reconcile_sort_state(&mut sort, &schema, None);
+    assert_eq!(sort, SortState::default());
+
+    sort.column = Some(SortColumn::Tag("genre".to_string()));
+    schema.insert("new-genre".to_string(), Vec::new());
+    reconcile_sort_state(&mut sort, &schema, Some(("genre", "new-genre")));
+    assert_eq!(sort.column, Some(SortColumn::Tag("new-genre".to_string())));
+}
+
+#[gpui::test]
+fn active_sort_survives_search_and_category_refresh(cx: &mut gpui::TestAppContext) {
+    let settings_path = settings_path("sorting-refresh");
+    let (music_dir, sfx_dir) = settings_with_folders(&settings_path);
+    fixture(&music_dir, "zulu.flac", &[("GENRE", "Zulu")]);
+    fixture(&music_dir, "Alpha.flac", &[("GENRE", "Alpha")]);
+    fixture(&music_dir, "middle.flac", &[("GENRE", "Middle")]);
+    fixture(&sfx_dir, "sfx.flac", &[]);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+    library.update(cx, |lib, cx| {
+        lib.toggle_sort(SortColumn::Name, cx);
+    });
+    let ascending = library.read_with(cx, |lib, _| {
+        lib.active_state()
+            .results
+            .iter()
+            .map(|record| record.name.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ascending, vec!["Alpha", "middle", "zulu"]);
+
+    library.update(cx, |lib, cx| lib.set_search("l".to_string(), cx));
+    let filtered = library.read_with(cx, |lib, _| {
+        lib.active_state()
+            .results
+            .iter()
+            .map(|record| record.name.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(filtered, vec!["Alpha", "middle", "zulu"]);
+
+    library.update(cx, |lib, _| lib.refresh_category_state(Category::Music));
+    let refreshed = library.read_with(cx, |lib, _| {
+        (
+            lib.active_state().sort.clone(),
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(refreshed.0.column, Some(SortColumn::Name));
+    assert_eq!(refreshed.1, vec!["Alpha", "middle", "zulu"]);
+
+    library.update(cx, |lib, cx| {
+        lib.toggle_sort(SortColumn::Name, cx);
+    });
+    let descending = library.read_with(cx, |lib, _| {
+        (
+            lib.active_state().sort.direction,
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(descending.0, SortDirection::Descending);
+    assert_eq!(descending.1, vec!["zulu", "middle", "Alpha"]);
+
+    library.update(cx, |lib, cx| {
+        lib.toggle_sort(SortColumn::Tag("genre".to_string()), cx);
+    });
+    let tag_sorted = library.read_with(cx, |lib, _| {
+        (
+            lib.active_state().sort.clone(),
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(
+        tag_sorted.0,
+        SortState {
+            column: Some(SortColumn::Tag("genre".to_string())),
+            direction: SortDirection::Ascending,
+        }
+    );
+    assert_eq!(tag_sorted.1, vec!["Alpha", "middle", "zulu"]);
+
+    library.update(cx, |lib, cx| {
+        lib.toggle_sort(SortColumn::Tag("GENRE".to_string()), cx);
+    });
+    let tag_descending = library.read_with(cx, |lib, _| {
+        (
+            lib.active_state().sort.direction,
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(tag_descending.0, SortDirection::Descending);
+    assert_eq!(tag_descending.1, vec!["zulu", "middle", "Alpha"]);
+
+    library.update(cx, |lib, cx| {
+        lib.set_category(Category::Sfx, cx);
+        lib.toggle_sort(SortColumn::Name, cx);
+    });
+    assert_eq!(
+        library.read_with(cx, |lib, _| lib.active_state().sort.column.clone()),
+        Some(SortColumn::Name)
+    );
+    library.update(cx, |lib, cx| lib.set_category(Category::Music, cx));
+    assert_eq!(
+        library.read_with(cx, |lib, _| lib.active_state().sort.column.clone()),
+        Some(SortColumn::Tag("genre".to_string()))
+    );
+
+    library.update(cx, |lib, cx| {
+        lib.rename_tag_key("genre", "Mood", cx);
+    });
+    assert_eq!(
+        library.read_with(cx, |lib, _| lib.active_state().sort.column.clone()),
+        Some(SortColumn::Tag("mood".to_string()))
+    );
+
+    library.update(cx, |lib, cx| {
+        lib.remove_tag_key("mood", cx);
+    });
+    assert_eq!(
+        library.read_with(cx, |lib, _| lib.active_state().sort.clone()),
+        SortState::default()
+    );
 }
 
 fn fixture(dir: &Path, name: &str, tags: &[(&str, &str)]) -> PathBuf {
@@ -581,6 +813,33 @@ fn async_search_discards_stale_results(cx: &mut gpui::TestAppContext) {
     });
     assert_eq!(search, "second");
     assert_eq!(names, vec!["second".to_string()]);
+}
+
+#[gpui::test]
+fn async_search_preserves_active_sort(cx: &mut gpui::TestAppContext) {
+    let settings_path = settings_path("async-search-sorting");
+    let (music_dir, _) = settings_with_folders(&settings_path);
+    fixture(&music_dir, "alpha.flac", &[]);
+    fixture(&music_dir, "middle.flac", &[]);
+    fixture(&music_dir, "zulu.flac", &[]);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+    library.update(cx, |library, cx| {
+        library.toggle_sort(SortColumn::Name, cx);
+        library.toggle_sort(SortColumn::Name, cx);
+        library.set_search_async(String::new(), cx);
+    });
+    cx.run_until_parked();
+
+    let names = library.read_with(cx, |library, _| {
+        library
+            .active_state()
+            .results
+            .iter()
+            .map(|record| record.name.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(names, vec!["zulu", "middle", "alpha"]);
 }
 
 #[gpui::test]
