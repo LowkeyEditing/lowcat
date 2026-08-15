@@ -19,10 +19,10 @@ use gpui::{
     Anchor, AnyElement, App, AppContext as _, AsyncApp, Bounds, ClickEvent, Context, CursorStyle,
     DismissEvent, DispatchPhase, Element, ElementId, Entity, FocusHandle, Focusable,
     GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement as _,
-    IntoElement, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
-    SharedString, Size, StatefulInteractiveElement as _, Style, Styled, Window, anchored, canvas,
-    deferred, div, fill, hsla, point, prelude::FluentBuilder as _, px, red, relative, size, white,
+    IntoElement, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString, Size,
+    StatefulInteractiveElement as _, Style, Styled, Window, anchored, canvas, deferred, div, fill,
+    hsla, point, prelude::FluentBuilder as _, px, red, relative, size, white,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable, StyledExt, VirtualListScrollHandle, WindowExt as _,
@@ -111,6 +111,13 @@ struct PendingFileDrag;
 struct ActiveFileDrag {
     label: String,
     paths: Vec<PathBuf>,
+}
+
+fn is_pointer_outside_window(position: Point<Pixels>, size: Size<Pixels>) -> bool {
+    position.x < px(0.)
+        || position.y < px(0.)
+        || position.x >= size.width
+        || position.y >= size.height
 }
 
 struct FileDragPreview {
@@ -2270,7 +2277,12 @@ impl FileTable {
         true
     }
 
-    fn begin_internal_file_drag(&mut self, drag: &InternalFileDrag, cx: &mut Context<Self>) {
+    fn begin_internal_file_drag(
+        &mut self,
+        drag: &InternalFileDrag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.native_drag_session.is_active() {
             return;
         }
@@ -2299,6 +2311,13 @@ impl FileTable {
                 data.paths.len()
             )
         });
+
+        // GPUI's drag-threshold callback can be the first event observed after
+        // the pointer has already crossed the window edge. Recheck immediately
+        // so that case does not require another move event.
+        if is_pointer_outside_window(window.mouse_position(), window.viewport_size()) {
+            self.start_native_file_drag(window, cx);
+        }
     }
 
     fn finish_local_file_drag(&mut self, window: &mut Window, _cx: &mut Context<Self>) {

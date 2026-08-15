@@ -1024,6 +1024,12 @@ impl Library {
         self.internal_file_drag.is_some()
     }
 
+    pub(crate) fn internal_file_drag_paths(&self) -> Option<&[PathBuf]> {
+        self.internal_file_drag
+            .as_ref()
+            .map(|drag| drag.paths.as_slice())
+    }
+
     pub fn clear_internal_file_drag(&mut self, cx: &mut Context<Self>) {
         if self.internal_file_drag.take().is_some() {
             cx.notify();

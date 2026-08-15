@@ -487,6 +487,23 @@ fn external_row_format_and_multi_drags_use_ready_trim_artifacts(cx: &mut gpui::T
                 .collect::<Vec<_>>(),
             "internal category drops retain source paths"
         );
+        assert_eq!(
+            lib.internal_file_drag_paths().unwrap(),
+            originals
+                .iter()
+                .cloned()
+                .map(canonical_or_original)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "re-entry bridge exposes original paths"
+        );
+        lib.clear_internal_file_drag(cx);
+        assert!(lib.internal_file_drag_paths().is_none());
+    });
+
+    library.read_with(cx, |lib, _| {
+        assert_eq!(lib.external_drag_paths(&originals).unwrap(), artifacts);
+        assert_ne!(lib.internal_file_drag_paths(), Some(artifacts.as_slice()));
     });
 }
 

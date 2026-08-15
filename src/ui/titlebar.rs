@@ -217,8 +217,12 @@ impl Render for AppTitleBar {
                     })
                     .on_drag_move::<ExternalPaths>(cx.listener(
                         move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
-                            let has_paths = !this.library.read(cx).internal_file_drag_active()
-                                && !event.drag(cx).paths().is_empty();
+                            let library = this.library.read(cx);
+                            let has_paths = if library.internal_file_drag_active() {
+                                library.internal_file_drag_paths().is_some()
+                            } else {
+                                !event.drag(cx).paths().is_empty()
+                            };
                             this.update_category_drag_hover(
                                 category,
                                 has_paths,
@@ -262,9 +266,16 @@ impl Render for AppTitleBar {
                         }
                     }))
                     .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                        if !this.library.read(cx).internal_file_drag_active() {
-                            this.drop_paths(category, paths.paths().to_vec(), cx);
-                        }
+                        let internal_paths = this
+                            .library
+                            .read(cx)
+                            .internal_file_drag_paths()
+                            .map(ToOwned::to_owned);
+                        this.drop_paths(
+                            category,
+                            internal_paths.unwrap_or_else(|| paths.paths().to_vec()),
+                            cx,
+                        );
                     }))
                     .on_drop(cx.listener(move |this, drag: &InternalFileDrag, _, cx| {
                         this.drop_paths(category, drag.paths(), cx);

@@ -124,3 +124,39 @@ fn native_drag_session_rejects_overlap_and_reopens_after_finish() {
 
     assert!(session.try_start());
 }
+
+#[test]
+fn threshold_first_outside_position_requires_immediate_handoff() {
+    let size = size(px(100.), px(80.));
+
+    // The threshold callback can establish the internal drag after the
+    // pointer has already crossed the drawable window boundary.
+    assert!(is_pointer_outside_window(point(px(100.), px(40.)), size));
+    assert!(!is_pointer_outside_window(point(px(99.), px(40.)), size));
+}
+
+#[test]
+fn pointer_boundary_treats_all_edges_as_outside() {
+    let size = size(px(100.), px(80.));
+
+    assert!(is_pointer_outside_window(point(px(-1.), px(40.)), size));
+    assert!(is_pointer_outside_window(point(px(40.), px(-1.)), size));
+    assert!(is_pointer_outside_window(point(px(100.), px(40.)), size));
+    assert!(is_pointer_outside_window(point(px(40.), px(80.)), size));
+}
+
+#[test]
+fn pointer_boundary_accepts_interior_and_rejects_zero_sized_window() {
+    assert!(!is_pointer_outside_window(
+        point(px(0.), px(0.)),
+        size(px(100.), px(80.))
+    ));
+    assert!(!is_pointer_outside_window(
+        point(px(99.99), px(79.99)),
+        size(px(100.), px(80.))
+    ));
+    assert!(is_pointer_outside_window(
+        point(px(0.), px(0.)),
+        size(px(0.), px(0.))
+    ));
+}
