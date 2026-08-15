@@ -1737,10 +1737,6 @@ fn record_is_recently_imported(
         .any(|variant| recent_import_paths.contains(&variant.path))
 }
 
-fn sort_records(records: &mut [FileRecord], sort: &SortState) {
-    records.sort_by(|left, right| compare_sort_values(left, right, sort));
-}
-
 fn compare_sort_values(left: &FileRecord, right: &FileRecord, sort: &SortState) -> Ordering {
     let Some(column) = sort.column.as_ref() else {
         return Ordering::Equal;

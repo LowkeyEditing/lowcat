@@ -3704,7 +3704,7 @@ dependencies = [
 
 [[package]]
 name = "lowcat"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "cocoa 0.26.0",
  "futures",
