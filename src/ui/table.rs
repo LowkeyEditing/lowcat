@@ -19,10 +19,10 @@ use gpui::{
     Anchor, AnyElement, App, AppContext as _, AsyncApp, Bounds, ClickEvent, Context, CursorStyle,
     DismissEvent, DispatchPhase, Element, ElementId, Entity, FocusHandle, Focusable,
     GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement as _,
-    IntoElement, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString, Size,
-    StatefulInteractiveElement as _, Style, Styled, Window, anchored, deferred, div, fill, hsla,
-    point, prelude::FluentBuilder as _, px, red, relative, size, white,
+    IntoElement, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
+    SharedString, Size, StatefulInteractiveElement as _, Style, Styled, Window, anchored, canvas,
+    deferred, div, fill, hsla, point, prelude::FluentBuilder as _, px, red, relative, size, white,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable, StyledExt, VirtualListScrollHandle, WindowExt as _,
@@ -35,7 +35,6 @@ use gpui_component::{
 };
 
 use crate::ui::CONTENT_PX;
-use crate::ui::titlebar::{TITLEBAR_HEIGHT, TITLEBAR_LEFT_OFFSET};
 use crate::{
     backend::RenameRecord,
     library::{Library, LibraryEvent},
@@ -1223,8 +1222,24 @@ impl FileTable {
         let Some(path) = self.active_preview_path().map(Path::to_path_buf) else {
             return false;
         };
-        self.library
-            .update(cx, |lib, cx| lib.play_preview_from_start(path, cx))
+        let trim_start = self
+            .library
+            .read(cx)
+            .active_state()
+            .all_records
+            .iter()
+            .find(|record| {
+                record.path == path || record.variants.iter().any(|variant| variant.path == path)
+            })
+            .and_then(FileRecord::effective_row_trim)
+            .map_or(0., |trim| trim.start_ratio);
+        self.library.update(cx, |lib, cx| {
+            if trim_start > 0. {
+                lib.play_preview_from_ratio(path, trim_start, cx)
+            } else {
+                lib.play_preview_from_start(path, cx)
+            }
+        })
     }
 
     fn play_preview_from_ratio(
@@ -2150,6 +2165,9 @@ impl FileTable {
     }
 
     fn set_row_hovered(&mut self, path: PathBuf, hovered: bool, cx: &mut Context<Self>) {
+        if self.preview_scrub.is_some() {
+            return;
+        }
         if hovered {
             if self.hovered_row.as_ref() != Some(&path) {
                 self.hovered_row = Some(path.clone());
@@ -2229,29 +2247,29 @@ impl FileTable {
     }
 
     pub(crate) fn cancel_file_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let native_drag_active = self.native_drag_session.is_active();
         let had_drag = self.pending_drag.is_some()
             || self.active_file_drag.is_some()
-            || self.library.read(cx).internal_file_drag_active();
+            || self.library.read(cx).internal_file_drag_active()
+            || native_drag_active;
         if !had_drag {
             return false;
         }
 
         self.clear_pending_drag();
         self.active_file_drag = None;
-        if !self.native_drag_session.is_active() {
-            window.on_next_frame(|window, _| native_drag::cancel_gpui_drag(window));
+        cx.stop_active_drag(window);
+        if native_drag_active && !native_drag::cancel_native_drag(window) {
+            self.native_drag_session.finish();
         }
+        window.on_next_frame(|window, _| native_drag::cancel_gpui_drag(window));
         self.library
             .update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
+        cx.notify();
         true
     }
 
-    fn begin_internal_file_drag(
-        &mut self,
-        drag: &InternalFileDrag,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn begin_internal_file_drag(&mut self, drag: &InternalFileDrag, cx: &mut Context<Self>) {
         if self.native_drag_session.is_active() {
             return;
         }
@@ -2280,7 +2298,6 @@ impl FileTable {
                 data.paths.len()
             )
         });
-        self.start_native_file_drag(window, cx);
     }
 
     fn finish_local_file_drag(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
@@ -2341,17 +2358,10 @@ impl FileTable {
             drag_label.clone()
         };
         let (drag_finished_tx, mut drag_finished_rx) = mpsc::unbounded::<native_drag::DragEnd>();
-        let window_bounds = window.bounds();
         let library = self.library.clone();
         cx.spawn(async move |_, cx| {
-            if let Some(end) = drag_finished_rx.next().await {
-                library.update(cx, |lib, cx| {
-                    if let Some(category) = category_for_native_drag_end(end, window_bounds) {
-                        lib.import_files(category, internal_drop_paths, cx);
-                    } else {
-                        lib.clear_internal_file_drag(cx);
-                    }
-                });
+            if drag_finished_rx.next().await.is_some() {
+                library.update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
             }
         })
         .detach();
@@ -2396,31 +2406,6 @@ impl Focusable for FileTable {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
-}
-
-fn category_for_native_drag_end(
-    end: native_drag::DragEnd,
-    window_bounds: Bounds<Pixels>,
-) -> Option<Category> {
-    if !end.released {
-        return None;
-    }
-
-    let local_x = end.screen_x as f32 - window_bounds.left().as_f32();
-    let local_y = window_bounds.bottom().as_f32() - end.screen_y as f32;
-    let left = TITLEBAR_LEFT_OFFSET.as_f32();
-    let available_width = window_bounds.size.width.as_f32() - left;
-    if local_x < left
-        || local_y < 0.0
-        || local_y > TITLEBAR_HEIGHT.as_f32()
-        || available_width <= 0.0
-    {
-        return None;
-    }
-
-    let category_width = available_width / Category::ALL.len() as f32;
-    let index = ((local_x - left) / category_width).floor() as usize;
-    Category::ALL.get(index).copied()
 }
 
 impl RenameTarget {

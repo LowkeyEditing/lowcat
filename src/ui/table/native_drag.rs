@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use gpui::Window;
 
 #[cfg(target_os = "macos")]
-pub(super) use macos::{DragEnd, StartDragError, cancel_gpui_drag};
+pub(super) use macos::{DragEnd, StartDragError, cancel_gpui_drag, cancel_native_drag};
 
 #[cfg(target_os = "macos")]
 pub(super) fn start_file_drag(
@@ -21,12 +21,15 @@ mod macos {
         fmt,
         panic::{AssertUnwindSafe, catch_unwind},
         path::PathBuf,
-        sync::{Mutex, OnceLock},
+        sync::{
+            Mutex, OnceLock,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     use cocoa::{
         appkit::{NSCompositingOperation, NSEventType},
-        base::{BOOL, NO, id, nil},
+        base::{BOOL, NO, YES, id, nil},
         foundation::{NSInteger, NSPoint, NSRect, NSSize, NSString, NSUInteger},
     };
     use gpui::Window;
@@ -56,6 +59,7 @@ mod macos {
     type FinishCallback = Box<dyn Fn(DragEnd) + Send>;
 
     static FINISH_CALLBACK: OnceLock<Mutex<Option<FinishCallback>>> = OnceLock::new();
+    static NATIVE_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
 
     struct RetainedDragEvent(id);
 
@@ -68,11 +72,7 @@ mod macos {
     }
 
     #[derive(Clone, Copy, Debug)]
-    pub(crate) struct DragEnd {
-        pub(crate) screen_x: f64,
-        pub(crate) screen_y: f64,
-        pub(crate) released: bool,
-    }
+    pub(crate) struct DragEnd;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum StartDragError {
@@ -256,6 +256,7 @@ mod macos {
             clear_finish_callback();
             return Err(StartDragError::AppKitRejectedSession);
         }
+        NATIVE_DRAG_ACTIVE.store(true, Ordering::Release);
 
         Ok(())
     }
@@ -461,6 +462,51 @@ mod macos {
         }
     }
 
+    pub(crate) fn cancel_native_drag(window: &mut Window) -> bool {
+        if !NATIVE_DRAG_ACTIVE.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+            return false;
+        };
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return false;
+        };
+        let view = handle.ns_view.as_ptr() as id;
+        if view == nil {
+            return false;
+        }
+
+        unsafe {
+            let native_window: id = msg_send![view, window];
+            let app: id = msg_send![class!(NSApplication), sharedApplication];
+            if native_window == nil || app == nil {
+                return false;
+            }
+            let window_number: NSInteger = msg_send![native_window, windowNumber];
+            let characters = NSString::alloc(nil).init_str("\u{1b}");
+            let event: id = msg_send![class!(NSEvent),
+                keyEventWithType:NSEventType::NSKeyDown as NSUInteger
+                location:NSPoint::new(0.0, 0.0)
+                modifierFlags:0 as NSUInteger
+                timestamp:0.0_f64
+                windowNumber:window_number
+                context:nil
+                characters:characters
+                charactersIgnoringModifiers:characters
+                isARepeat:NO
+                keyCode:53_u16
+            ];
+            let _: () = msg_send![characters, release];
+            if event == nil {
+                return false;
+            }
+            let _: () = msg_send![app, postEvent:event atStart:YES];
+        }
+        true
+    }
+
     fn absolute_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         paths
             .into_iter()
@@ -545,23 +591,13 @@ mod macos {
         NS_DRAG_OPERATION_COPY
     }
 
-    extern "C" fn dragging_session_ended(
-        this: &Object,
-        _: Sel,
-        _: id,
-        ended_at_point: NSPoint,
-        _: NSUInteger,
-    ) {
-        let end = DragEnd {
-            screen_x: ended_at_point.x,
-            screen_y: ended_at_point.y,
-            released: !left_mouse_button_pressed(),
-        };
+    extern "C" fn dragging_session_ended(this: &Object, _: Sel, _: id, _: NSPoint, _: NSUInteger) {
+        NATIVE_DRAG_ACTIVE.store(false, Ordering::Release);
         let view = unsafe { *this.get_ivar::<usize>(GPUI_VIEW_IVAR) as id };
         unsafe {
             finish_gpui_mouse_drag(view);
         }
-        run_finish_callback(end);
+        run_finish_callback(DragEnd);
     }
 
     #[cfg(test)]

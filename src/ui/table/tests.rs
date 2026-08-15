@@ -113,35 +113,6 @@ fn internal_drag_payload_updates_for_mouse_down_selection() {
 }
 
 #[test]
-fn native_drag_release_maps_to_category_tabs_but_cancel_does_not() {
-    let bounds = Bounds::new(point(px(100.), px(200.)), size(px(500.), px(400.)));
-    let first_tab = native_drag::DragEnd {
-        screen_x: 200.,
-        screen_y: 590.,
-        released: true,
-    };
-    let second_tab = native_drag::DragEnd {
-        screen_x: 450.,
-        screen_y: 590.,
-        released: true,
-    };
-    let canceled = native_drag::DragEnd {
-        released: false,
-        ..first_tab
-    };
-
-    assert_eq!(
-        category_for_native_drag_end(first_tab, bounds),
-        Some(Category::Music)
-    );
-    assert_eq!(
-        category_for_native_drag_end(second_tab, bounds),
-        Some(Category::Sfx)
-    );
-    assert_eq!(category_for_native_drag_end(canceled, bounds), None);
-}
-
-#[test]
 fn native_drag_session_rejects_overlap_and_reopens_after_finish() {
     let session = NativeDragSession::default();
 

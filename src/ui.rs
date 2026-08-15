@@ -274,6 +274,10 @@ impl UI {
             cx.stop_propagation();
             return;
         }
+        if event.keystroke.key == "escape" && self.cancel_file_drag(window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.folder_tag_modal.is_some() {
             if event.keystroke.modifiers.platform && event.keystroke.key == "a" {
                 self.select_all_folder_tag_rows(cx);
@@ -292,7 +296,6 @@ impl UI {
                 || self.cancel_tag_edit(window, cx)
                 || self.cancel_column_visibility_menu(cx)
                 || self.cancel_tag_group_menu(cx)
-                || self.cancel_file_drag(window, cx)
                 || self.cancel_search_if_no_selection(window, cx)
                 || self.clear_selection(cx)
             {

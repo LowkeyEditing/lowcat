@@ -1,10 +1,7 @@
-use std::time::Duration;
-
 use gpui::{
-    AsyncApp, Bounds, ClickEvent, Context, DragMoveEvent, Entity, ExternalPaths,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement, PathPromptOptions, Pixels,
-    Point, Render, SharedString, StatefulInteractiveElement as _, Styled, Window, div, point,
-    prelude::FluentBuilder as _, px,
+    AsyncApp, ClickEvent, Context, DragMoveEvent, Entity, ExternalPaths, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement, PathPromptOptions, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt,
@@ -26,7 +23,6 @@ pub struct AppTitleBar {
     library: Entity<Library>,
     hovered_category: Option<Category>,
     drag_hovered_category: Option<Category>,
-    drag_hover_watch_running: bool,
     folder_prompt_active: bool,
     should_move_window: bool,
 }
@@ -39,125 +35,30 @@ impl AppTitleBar {
             library,
             hovered_category: None,
             drag_hovered_category: None,
-            drag_hover_watch_running: false,
             folder_prompt_active: false,
             should_move_window: false,
         }
-    }
-
-    fn start_drag_hover_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.drag_hover_watch_running {
-            return;
-        }
-
-        self.drag_hover_watch_running = true;
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-                let should_continue = this
-                    .update_in(cx, |this, window, cx| {
-                        if !this.library.read(cx).internal_file_drag_active() {
-                            this.drag_hovered_category = None;
-                            this.drag_hover_watch_running = false;
-                            cx.notify();
-                            return false;
-                        }
-
-                        let mouse_position = live_window_mouse_position(window);
-                        let hovered = category_at_window_position(mouse_position, window);
-                        if this.drag_hovered_category != hovered {
-                            this.drag_hovered_category = hovered;
-                            debug_titlebar_interaction(|| {
-                                format!(
-                                    "watch drag hover: category={} mouse_x={:.1} mouse_y={:.1}",
-                                    hovered.map(|category| category.label()).unwrap_or("none"),
-                                    mouse_position.x.as_f32(),
-                                    mouse_position.y.as_f32()
-                                )
-                            });
-                            cx.notify();
-                        }
-
-                        true
-                    })
-                    .ok()
-                    .unwrap_or(false);
-
-                if !should_continue {
-                    break;
-                }
-            }
-        })
-        .detach();
     }
 
     fn update_category_drag_hover(
         &mut self,
         category: Category,
         has_paths: bool,
-        event_position: Point<Pixels>,
-        bounds: Bounds<Pixels>,
-        window: &mut Window,
+        hovered: bool,
         cx: &mut Context<Self>,
     ) {
         let is_current = self.drag_hovered_category == Some(category);
-        if !self.library.read(cx).internal_file_drag_active() {
+        if !has_paths || !hovered {
             if is_current {
                 self.drag_hovered_category = None;
-                debug_titlebar_interaction(|| {
-                    format!("clear drag hover: inactive category={}", category.label())
-                });
                 cx.notify();
             }
             return;
         }
 
-        if !has_paths {
-            if is_current {
-                self.drag_hovered_category = None;
-                debug_titlebar_interaction(|| {
-                    format!(
-                        "clear drag hover: empty paths category={}",
-                        category.label()
-                    )
-                });
-                cx.notify();
-            }
-            return;
-        }
-
-        if bounds.contains(&event_position) {
-            self.start_drag_hover_watch(window, cx);
-            if !is_current {
-                self.drag_hovered_category = Some(category);
-                debug_titlebar_interaction(|| {
-                    format!(
-                        "set drag hover: category={} x={:.1} y={:.1}",
-                        category.label(),
-                        event_position.x.as_f32(),
-                        event_position.y.as_f32()
-                    )
-                });
-                cx.notify();
-            }
-        } else if is_current {
-            let mouse_position = live_window_mouse_position(window);
-            if !bounds.contains(&mouse_position) {
-                self.drag_hovered_category = None;
-                debug_titlebar_interaction(|| {
-                    format!(
-                        "clear drag hover: actual leave category={} event_x={:.1} event_y={:.1} mouse_x={:.1} mouse_y={:.1}",
-                        category.label(),
-                        event_position.x.as_f32(),
-                        event_position.y.as_f32(),
-                        mouse_position.x.as_f32(),
-                        mouse_position.y.as_f32()
-                    )
-                });
-                cx.notify();
-            }
+        if !is_current {
+            self.drag_hovered_category = Some(category);
+            cx.notify();
         }
     }
 
@@ -222,13 +123,10 @@ impl AppTitleBar {
 }
 
 impl Render for AppTitleBar {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_start = crate::perf::start();
         let active = self.library.read(cx).active();
         let internal_drag_active = self.library.read(cx).internal_file_drag_active();
-        if internal_drag_active {
-            self.start_drag_hover_watch(window, cx);
-        }
         if !internal_drag_active && self.drag_hovered_category.take().is_some() {
             debug_titlebar_interaction(|| "clear drag hover: internal drag inactive".to_string());
         }
@@ -318,27 +216,25 @@ impl Render for AppTitleBar {
                         this.child(div().absolute().right(px(6.)).child(folder_button))
                     })
                     .on_drag_move::<ExternalPaths>(cx.listener(
-                        move |this, event: &DragMoveEvent<ExternalPaths>, window, cx| {
-                            let has_paths = !event.drag(cx).paths().is_empty();
+                        move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                            let has_paths = !this.library.read(cx).internal_file_drag_active()
+                                && !event.drag(cx).paths().is_empty();
                             this.update_category_drag_hover(
                                 category,
                                 has_paths,
-                                event.event.position,
-                                event.bounds,
-                                window,
+                                event.bounds.contains(&event.event.position),
                                 cx,
                             );
                         },
                     ))
                     .on_drag_move::<InternalFileDrag>(cx.listener(
-                        move |this, event: &DragMoveEvent<InternalFileDrag>, window, cx| {
-                            let has_paths = !event.drag(cx).is_empty();
+                        move |this, event: &DragMoveEvent<InternalFileDrag>, _, cx| {
+                            let has_paths = this.library.read(cx).internal_file_drag_active()
+                                && !event.drag(cx).is_empty();
                             this.update_category_drag_hover(
                                 category,
                                 has_paths,
-                                event.event.position,
-                                event.bounds,
-                                window,
+                                event.bounds.contains(&event.event.position),
                                 cx,
                             );
                         },
@@ -366,7 +262,9 @@ impl Render for AppTitleBar {
                         }
                     }))
                     .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                        this.drop_paths(category, paths.paths().to_vec(), cx);
+                        if !this.library.read(cx).internal_file_drag_active() {
+                            this.drop_paths(category, paths.paths().to_vec(), cx);
+                        }
                     }))
                     .on_drop(cx.listener(move |this, drag: &InternalFileDrag, _, cx| {
                         this.drop_paths(category, drag.paths(), cx);
@@ -413,37 +311,6 @@ impl Render for AppTitleBar {
         });
         titlebar
     }
-}
-
-fn category_at_window_position(position: gpui::Point<Pixels>, window: &Window) -> Option<Category> {
-    let x = position.x.as_f32();
-    let y = position.y.as_f32();
-    let left = TITLEBAR_LEFT_OFFSET.as_f32();
-    let available_width = window.viewport_size().width.as_f32() - left;
-    if x < left || y < 0.0 || y > TITLEBAR_HEIGHT.as_f32() || available_width <= 0.0 {
-        return None;
-    }
-
-    let category_width = available_width / Category::ALL.len() as f32;
-    let index = ((x - left) / category_width).floor() as usize;
-    Category::ALL.get(index).copied()
-}
-
-#[cfg(target_os = "macos")]
-fn live_window_mouse_position(window: &Window) -> gpui::Point<Pixels> {
-    use cocoa::{appkit::NSEvent as _, base::nil};
-
-    let screen_position = unsafe { cocoa::base::id::mouseLocation(nil) };
-    let window_bounds = window.bounds();
-    point(
-        px(screen_position.x as f32) - window_bounds.left(),
-        window_bounds.bottom() - px(screen_position.y as f32),
-    )
-}
-
-#[cfg(not(target_os = "macos"))]
-fn live_window_mouse_position(window: &Window) -> gpui::Point<Pixels> {
-    window.mouse_position()
 }
 
 fn debug_titlebar_interaction(details: impl FnOnce() -> String) {

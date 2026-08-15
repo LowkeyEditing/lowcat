@@ -206,9 +206,9 @@ impl FileTable {
                 }),
             )
             .when(!self.alt_down, |row| {
-                row.on_drag(row_drag, move |drag, cursor_offset, window, cx| {
+                row.on_drag(row_drag, move |drag, cursor_offset, _, cx| {
                     table_for_drag.update(cx, |this, cx| {
-                        this.begin_internal_file_drag(drag, window, cx);
+                        this.begin_internal_file_drag(drag, cx);
                     });
                     cx.new(|_| FileDragPreview::new(drag, cursor_offset))
                 })
@@ -518,13 +518,11 @@ impl FileTable {
                                     .when(!self.alt_down, |chip| {
                                         chip.on_drag(
                                             format_drag,
-                                            move |drag, cursor_offset, window, cx| {
+                                            move |drag, cursor_offset, _, cx| {
                                                 table_for_format_drag.update(
                                                     cx,
                                                     |this, cx| {
-                                                        this.begin_internal_file_drag(
-                                                            drag, window, cx,
-                                                        );
+                                                        this.begin_internal_file_drag(drag, cx);
                                                     },
                                                 );
                                                 cx.new(|_| {
@@ -1014,6 +1012,21 @@ impl Render for FileTable {
         };
         let column_visibility_menu =
             self.render_column_visibility_menu(tag_column_keys, window, cx);
+        let table_for_window_exit = cx.entity();
+        let native_drag_on_window_exit = canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        table_for_window_exit.update(cx, |this, cx| {
+                            this.start_native_file_drag(window, cx);
+                        });
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0();
 
         let table = div()
             .track_focus(&self.focus_handle)
@@ -1031,7 +1044,8 @@ impl Render for FileTable {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "escape"
-                        if this.close_column_visibility_menu(cx)
+                        if this.cancel_file_drag(window, cx)
+                            || this.close_column_visibility_menu(cx)
                             || this.cancel_delete(cx)
                             || this.clear_selection(cx) =>
                     {
@@ -1071,6 +1085,7 @@ impl Render for FileTable {
                     .min_h_0()
                     .child(div().size_full().child(rows)),
             )
+            .child(native_drag_on_window_exit)
             .when_some(column_visibility_menu, |table, menu| table.child(menu));
 
         crate::perf::finish("table.render", render_start, || {
