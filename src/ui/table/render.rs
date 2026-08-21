@@ -116,30 +116,12 @@ impl FileTable {
         let recently_imported_bg = cx.theme().success.opacity(0.14);
         let favorite_bg = cx.theme().warning.opacity(0.14);
         let chip_delete_bg = red().opacity(0.18);
-        let row_delete_bg = red().opacity(0.18);
-        let format_chip_hovered = self.hovered_format_chip.as_ref().is_some_and(|hovered| {
-            record
-                .variants
-                .iter()
-                .any(|variant| &variant.path == hovered)
-        });
         let row_hovered = self.hovered_row.as_ref() == Some(&path);
-        let row_delete_hover_enabled = self.hovered_tag_chip.is_none() && !format_chip_hovered;
-        let delete_hovered = row_delete_hover_enabled
-            && self.alt_down
-            && self.hovered_delete_row.as_ref().is_some_and(|hovered| {
-                if self.selected.len() > 1 && self.selected.contains(hovered.as_path()) {
-                    selected
-                } else {
-                    hovered == &path
-                }
-            });
         let open_path = record.path.clone();
         let open_preview_active = preview_active;
         let select_path = record.path.clone();
         let pending_drag_name = record.name.clone();
         let hover_path = record.path.clone();
-        let delete_click_target = delete_target.clone();
         let conversion_actions = multi_selection
             .map(|actions| actions.conversion_actions.clone())
             .unwrap_or_else(|| Self::record_conversion_actions(record));
@@ -174,15 +156,11 @@ impl FileTable {
             .when(favorite_highlighted, |s| s.bg(favorite_bg))
             .when(recently_imported, |s| s.bg(recently_imported_bg))
             .when(selected || row_hovered, |s| s.bg(row_hover_bg))
-            .when(delete_hovered, |s| s.bg(row_delete_bg))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.set_row_hovered(hover_path.clone(), *hovered, cx);
             }))
             .on_click(cx.listener(move |_, event: &ClickEvent, _, _| {
                 if open_preview_active {
-                    return;
-                }
-                if event.modifiers().alt {
                     return;
                 }
                 if event.click_count() == 2 {
@@ -193,16 +171,6 @@ impl FileTable {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     if event.click_count == 1 {
-                        if event.modifiers.alt {
-                            this.clear_pending_drag();
-                            this.confirm_delete_target(
-                                delete_click_target.as_ref().clone(),
-                                window,
-                                cx,
-                            );
-                            cx.stop_propagation();
-                            return;
-                        }
                         if event.modifiers.shift || !this.selected.contains(&select_path) {
                             this.select_row(select_path.clone(), event.modifiers.shift, window, cx);
                         }
@@ -215,13 +183,11 @@ impl FileTable {
                     }
                 }),
             )
-            .when(!self.alt_down, |row| {
-                row.on_drag(row_drag, move |drag, cursor_offset, window, cx| {
-                    table_for_drag.update(cx, |this, cx| {
-                        this.begin_internal_file_drag(drag, window, cx);
-                    });
-                    cx.new(|_| FileDragPreview::new(drag, cursor_offset))
-                })
+            .on_drag(row_drag, move |drag, cursor_offset, window, cx| {
+                table_for_drag.update(cx, |this, cx| {
+                    this.begin_internal_file_drag(drag, window, cx);
+                });
+                cx.new(|_| FileDragPreview::new(drag, cursor_offset))
             })
             .on_mouse_up(
                 MouseButton::Left,

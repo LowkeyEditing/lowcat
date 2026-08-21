@@ -68,7 +68,7 @@ pub struct Library {
 
 #[derive(Clone)]
 pub enum LibraryEvent {
-    TagEdited { path: PathBuf },
+    TagEdited,
     PreviewAdvanced,
 }
 
@@ -717,7 +717,7 @@ impl Library {
         match self.backend.add_tag(self.active, &path, key, value) {
             Ok(()) => {
                 self.refresh_category_state(self.active);
-                cx.emit(LibraryEvent::TagEdited { path });
+                cx.emit(LibraryEvent::TagEdited);
                 cx.notify();
             }
             Err(error) => {
@@ -800,7 +800,7 @@ impl Library {
         match self.backend.remove_tag(self.active, &path, key, value) {
             Ok(()) => {
                 self.refresh_category_state(self.active);
-                cx.emit(LibraryEvent::TagEdited { path });
+                cx.emit(LibraryEvent::TagEdited);
                 cx.notify();
             }
             Err(error) => {
@@ -830,7 +830,7 @@ impl Library {
                 debug_library_interaction(|| {
                     format!("rename_tag key={key} old={old_value} new={new_value}")
                 });
-                cx.emit(LibraryEvent::TagEdited { path });
+                cx.emit(LibraryEvent::TagEdited);
                 cx.notify();
             }
             Err(error) => {

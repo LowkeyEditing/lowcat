@@ -537,7 +537,6 @@ pub struct FileTable {
     hovered_tag_chip: Option<TagChipTarget>,
     hovered_tag_key: Option<String>,
     hovered_format_chip: Option<PathBuf>,
-    hovered_delete_row: Option<PathBuf>,
     pending_delete: Option<PendingDelete>,
     pending_context_menu_delete: Option<DeleteTarget>,
     pending_rename: Option<PendingRename>,
@@ -664,13 +663,10 @@ impl FileTable {
             &library,
             window,
             |this, library, event: &LibraryEvent, window, cx| match event {
-                LibraryEvent::TagEdited { path } => {
+                LibraryEvent::TagEdited => {
                     this.tag_width_cache = None;
                     this.hovered_tag_chip = None;
                     this.hovered_tag_key = None;
-                    if this.hovered_row.as_ref() == Some(path) {
-                        this.hovered_delete_row = Some(path.clone());
-                    }
                     cx.notify();
                 }
                 LibraryEvent::PreviewAdvanced => {
@@ -751,7 +747,6 @@ impl FileTable {
             hovered_tag_chip: None,
             hovered_tag_key: None,
             hovered_format_chip: None,
-            hovered_delete_row: None,
             pending_delete: None,
             pending_context_menu_delete: None,
             pending_rename: None,
@@ -2214,7 +2209,6 @@ impl FileTable {
         self.hovered_tag_chip = None;
         self.hovered_tag_key = None;
         self.hovered_format_chip = None;
-        self.hovered_delete_row = None;
         self.library
             .update(cx, |lib, cx| lib.trash_files(paths, cx));
         cx.notify();
@@ -2228,7 +2222,6 @@ impl FileTable {
         if hovered {
             if self.hovered_row.as_ref() != Some(&path) {
                 self.hovered_row = Some(path.clone());
-                self.hovered_delete_row = Some(path.clone());
                 if self.cmd_down {
                     if self.preview_scrub.as_ref().map(|scrub| &scrub.path) != Some(&path) {
                         self.preview_scrub = None;
@@ -2240,9 +2233,6 @@ impl FileTable {
             }
         } else if self.hovered_row.as_ref() == Some(&path) {
             self.hovered_row = None;
-            if self.hovered_delete_row.as_ref() == Some(&path) {
-                self.hovered_delete_row = None;
-            }
             if self.preview_active_row.as_ref() == Some(&path) {
                 self.preview_active_row = None;
             }
