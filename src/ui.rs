@@ -74,6 +74,10 @@ impl UI {
                 this.library
                     .update(cx, |lib, cx| lib.rescan_after_focus(cx));
             } else {
+                this.toolbar
+                    .update(cx, |toolbar, cx| toolbar.set_alt_down(false, cx));
+                this.table
+                    .update(cx, |table, cx| table.set_alt_down(false, cx));
                 this.table
                     .update(cx, |table, cx| table.set_cmd_down(false, cx));
             }
@@ -199,9 +203,9 @@ impl UI {
             || self.table.read(cx).rename_input_is_focused(window, cx)
     }
 
-    fn play_cmd_hovered_preview_from_start(&mut self, cx: &mut Context<Self>) -> bool {
+    fn play_opt_hovered_preview_from_start(&mut self, cx: &mut Context<Self>) -> bool {
         self.table.update(cx, |table, cx| {
-            table.play_cmd_hovered_preview_from_start(cx)
+            table.play_opt_hovered_preview_from_start(cx)
         })
     }
 
@@ -309,8 +313,8 @@ impl UI {
                 cx.stop_propagation();
             }
         } else if event.keystroke.key == "space"
-            && event.keystroke.modifiers.platform
-            && self.play_cmd_hovered_preview_from_start(cx)
+            && event.keystroke.modifiers.alt
+            && self.play_opt_hovered_preview_from_start(cx)
         {
             cx.stop_propagation();
         } else if event.keystroke.modifiers.platform && event.keystroke.key == "f" {

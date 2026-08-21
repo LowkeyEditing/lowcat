@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn cmd_preview_does_not_activate_during_row_editing() {
+fn opt_preview_does_not_activate_during_row_editing() {
     let path = PathBuf::from("/tmp/preview.wav");
 
     assert_eq!(
@@ -17,7 +17,15 @@ fn cmd_preview_does_not_activate_during_row_editing() {
 #[test]
 fn sub_threshold_preview_movement_seeks_once_on_release() {
     let path = PathBuf::from("/tmp/preview.wav");
-    let mut scrub = Some(PreviewScrub::new(path.clone(), 0.2, 20., 100., None, None));
+    let mut scrub = Some(PreviewScrub::new(
+        path.clone(),
+        0.2,
+        20.,
+        100.,
+        None,
+        None,
+        false,
+    ));
 
     assert!(scrub.as_mut().unwrap().update(&path, 0.23, 23.));
     assert_eq!(
@@ -34,9 +42,38 @@ fn sub_threshold_preview_movement_seeks_once_on_release() {
 }
 
 #[test]
+fn opt_only_preview_drag_seeks_without_creating_trim() {
+    let path = PathBuf::from("/tmp/preview.wav");
+    let mut scrub = Some(PreviewScrub::new(
+        path.clone(),
+        0.2,
+        20.,
+        100.,
+        None,
+        None,
+        false,
+    ));
+
+    assert!(scrub.as_mut().unwrap().update(&path, 0.8, 80.));
+    assert_eq!(scrub.as_ref().unwrap().provisional_trim(), None);
+    assert_eq!(
+        PreviewScrub::take_release_for_path(&mut scrub, &path),
+        Some(PreviewPointerRelease::Seek(0.8))
+    );
+}
+
+#[test]
 fn threshold_preview_movement_creates_normalized_trim() {
     let path = PathBuf::from("/tmp/preview.wav");
-    let mut scrub = Some(PreviewScrub::new(path.clone(), 0.8, 80., 100., None, None));
+    let mut scrub = Some(PreviewScrub::new(
+        path.clone(),
+        0.8,
+        80.,
+        100.,
+        None,
+        None,
+        true,
+    ));
 
     assert!(scrub.as_mut().unwrap().update(&path, 0.3, 30.));
     assert_eq!(
@@ -58,6 +95,7 @@ fn trim_handles_clamp_to_one_pixel_without_crossing() {
         100.,
         Some(TrimEdge::Start),
         Some(original),
+        true,
     );
     start.update(&path, 0.95, 95.);
     assert_eq!(
@@ -72,6 +110,7 @@ fn trim_handles_clamp_to_one_pixel_without_crossing() {
         100.,
         Some(TrimEdge::End),
         Some(original),
+        true,
     );
     end.update(&path, 0.05, 5.);
     let adjusted = end.provisional_trim().unwrap();

@@ -355,6 +355,7 @@ enum PreviewPointerMode {
 struct PreviewScrub {
     path: PathBuf,
     width: f32,
+    trim_enabled: bool,
     mode: PreviewPointerMode,
 }
 
@@ -373,6 +374,7 @@ impl PreviewScrub {
         width: f32,
         edge: Option<TrimEdge>,
         persisted: Option<TrimRange>,
+        trim_enabled: bool,
     ) -> Self {
         let ratio = ratio.clamp(0., 1.);
         let mode = match (edge, persisted) {
@@ -393,6 +395,7 @@ impl PreviewScrub {
         Self {
             path,
             width: width.max(1.),
+            trim_enabled,
             mode,
         }
     }
@@ -408,7 +411,7 @@ impl PreviewScrub {
                 press_x,
                 anchor_ratio,
                 ..
-            } if (x - press_x).abs() >= TRIM_DRAG_THRESHOLD_PX => {
+            } if self.trim_enabled && (x - press_x).abs() >= TRIM_DRAG_THRESHOLD_PX => {
                 PreviewPointerMode::NewSelection {
                     anchor_ratio,
                     current_ratio: ratio,
@@ -1174,26 +1177,30 @@ impl FileTable {
     }
 
     pub(crate) fn set_alt_down(&mut self, alt_down: bool, cx: &mut Context<Self>) {
-        if self.alt_down != alt_down {
-            self.alt_down = alt_down;
-            cx.notify();
+        if self.alt_down == alt_down {
+            return;
         }
+        if self.alt_down && !alt_down && self.preview_active_row.is_some() {
+            self.library.update(cx, |lib, cx| {
+                lib.stop_preview(cx);
+            });
+        }
+        if !alt_down {
+            self.preview_scrub = None;
+        }
+        self.alt_down = alt_down;
+        self.update_preview_active_row(cx);
     }
 
     pub(crate) fn set_cmd_down(&mut self, cmd_down: bool, cx: &mut Context<Self>) {
         if self.cmd_down == cmd_down {
             return;
         }
-        if self.cmd_down && !cmd_down && self.preview_active_row.is_some() {
-            self.library.update(cx, |lib, cx| {
-                lib.stop_preview(cx);
-            });
-        }
         if !cmd_down {
             self.preview_scrub = None;
         }
         self.cmd_down = cmd_down;
-        self.update_preview_active_row(cx);
+        cx.notify();
     }
 
     fn row_edit_active(&self) -> bool {
@@ -1201,21 +1208,21 @@ impl FileTable {
     }
 
     fn preview_path_for_state(
-        cmd_down: bool,
+        opt_down: bool,
         hovered_row: Option<&PathBuf>,
-        row_edit_active: bool,
+        preview_blocked: bool,
     ) -> Option<PathBuf> {
-        (cmd_down && !row_edit_active)
+        (opt_down && !preview_blocked)
             .then(|| hovered_row.cloned())
             .flatten()
     }
 
     fn update_preview_active_row(&mut self, cx: &mut Context<Self>) {
-        let next = Self::preview_path_for_state(
-            self.cmd_down,
-            self.hovered_row.as_ref(),
-            self.row_edit_active(),
-        );
+        let preview_blocked = self.row_edit_active()
+            || self.hovered_tag_chip.is_some()
+            || self.hovered_format_chip.is_some();
+        let next =
+            Self::preview_path_for_state(self.alt_down, self.hovered_row.as_ref(), preview_blocked);
         if self.preview_active_row != next {
             if self.preview_scrub.as_ref().map(|scrub| &scrub.path) != next.as_ref() {
                 self.preview_scrub = None;
@@ -1232,7 +1239,7 @@ impl FileTable {
         self.preview_active_row.as_deref()
     }
 
-    pub(crate) fn play_cmd_hovered_preview_from_start(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn play_opt_hovered_preview_from_start(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(path) = self.active_preview_path().map(Path::to_path_buf) else {
             return false;
         };
@@ -1274,26 +1281,53 @@ impl FileTable {
         width: f32,
         edge: Option<TrimEdge>,
         persisted: Option<TrimRange>,
+        trim_enabled: bool,
         cx: &mut Context<Self>,
     ) {
         self.cancel_unstarted_file_drag(cx);
-        let scrub = PreviewScrub::new(path, ratio, x, width, edge, persisted);
+        let scrub = PreviewScrub::new(path, ratio, x, width, edge, persisted, trim_enabled);
         if self.preview_scrub.as_ref() != Some(&scrub) {
             self.preview_scrub = Some(scrub);
             cx.notify();
         }
     }
 
-    fn continue_preview_scrub(&mut self, path: &Path, ratio: f32, x: f32, cx: &mut Context<Self>) {
+    fn continue_preview_scrub(
+        &mut self,
+        path: &Path,
+        ratio: f32,
+        x: f32,
+        trim_modifiers_down: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(scrub) = self.preview_scrub.as_mut() else {
             return;
         };
+        if scrub.trim_enabled && !trim_modifiers_down {
+            self.preview_scrub = None;
+            cx.notify();
+            return;
+        }
         if scrub.update(path, ratio, x) {
             cx.notify();
         }
     }
 
-    fn end_preview_scrub(&mut self, path: &Path, cx: &mut Context<Self>) {
+    fn end_preview_scrub(
+        &mut self,
+        path: &Path,
+        trim_modifiers_down: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .preview_scrub
+            .as_ref()
+            .is_some_and(|scrub| scrub.trim_enabled && !trim_modifiers_down)
+        {
+            self.preview_scrub = None;
+            cx.notify();
+            return;
+        }
         let Some(release) = PreviewScrub::take_release_for_path(&mut self.preview_scrub, path)
         else {
             return;
@@ -2222,7 +2256,7 @@ impl FileTable {
         if hovered {
             if self.hovered_row.as_ref() != Some(&path) {
                 self.hovered_row = Some(path.clone());
-                if self.cmd_down {
+                if self.alt_down {
                     if self.preview_scrub.as_ref().map(|scrub| &scrub.path) != Some(&path) {
                         self.preview_scrub = None;
                     }
@@ -2258,6 +2292,7 @@ impl FileTable {
             if changed {
                 self.hovered_tag_chip = Some(target);
                 cx.notify();
+                self.update_preview_active_row(cx);
             }
         } else if self.hovered_tag_chip.as_ref().is_some_and(|hovered| {
             hovered.path == target.path
@@ -2266,6 +2301,7 @@ impl FileTable {
         }) {
             self.hovered_tag_chip = None;
             cx.notify();
+            self.update_preview_active_row(cx);
         }
     }
 
@@ -2286,10 +2322,12 @@ impl FileTable {
             if self.hovered_format_chip.as_ref() != Some(&path) {
                 self.hovered_format_chip = Some(path);
                 cx.notify();
+                self.update_preview_active_row(cx);
             }
         } else if self.hovered_format_chip.as_ref() == Some(&path) {
             self.hovered_format_chip = None;
             cx.notify();
+            self.update_preview_active_row(cx);
         }
     }
 

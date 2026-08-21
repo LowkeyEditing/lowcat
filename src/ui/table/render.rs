@@ -373,6 +373,7 @@ impl FileTable {
                     path.clone(),
                     waveform,
                     trim,
+                    self.alt_down && self.cmd_down,
                     self.preview_playhead_bits.clone(),
                 )))
             })
