@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 
 use crate::model::{AudioFormat, Category};
 
@@ -113,6 +114,39 @@ impl Settings {
         tags: BTreeMap<String, BTreeSet<String>>,
     ) {
         *self.intersection_tags.for_category_mut(category) = tags;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsStore {
+    path: PathBuf,
+    value: Settings,
+}
+
+impl SettingsStore {
+    pub fn load(path: PathBuf) -> Self {
+        let value = Settings::load(&path);
+        Self { path, value }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn update(&mut self, mutate: impl FnOnce(&mut Settings)) -> io::Result<()> {
+        let mut next = self.value.clone();
+        mutate(&mut next);
+        next.save(&self.path)?;
+        self.value = next;
+        Ok(())
+    }
+}
+
+impl Deref for SettingsStore {
+    type Target = Settings;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }
 

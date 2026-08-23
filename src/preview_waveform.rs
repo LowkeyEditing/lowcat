@@ -42,7 +42,9 @@ fn generate_waveform_from_image(path: &Path) -> io::Result<WaveformBinary256> {
 }
 
 fn generate_waveform_from_samples(path: &Path) -> io::Result<WaveformBinary256> {
-    let channels = probe_audio_channels(path).unwrap_or(2).max(1);
+    let channels = crate::media_tools::probe_audio_channels(path)
+        .unwrap_or(2)
+        .max(1);
     let mut child = crate::media_tools::command("ffmpeg")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -166,27 +168,6 @@ pub(crate) fn waveform_from_samples(
         *out = ((value / max_rms).clamp(0., 1.) * 255.).round() as u8;
     }
     waveform
-}
-
-fn probe_audio_channels(path: &Path) -> io::Result<usize> {
-    let output = crate::media_tools::command("ffprobe")
-        .arg("-v")
-        .arg("error")
-        .arg("-select_streams")
-        .arg("a:0")
-        .arg("-show_entries")
-        .arg("stream=channels")
-        .arg("-of")
-        .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(path)
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other("ffprobe channel probe failed"));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.trim()
-        .parse::<usize>()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]

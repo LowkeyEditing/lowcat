@@ -18,10 +18,9 @@ use migrations::{
 };
 
 use crate::model::{
-    AudioFormat, Category, ConvertConflictBehavior, FileRecord, FileSupport, FileVariant,
-    TrimArtifactState, TrimRange, WaveformBinary256, default_format_priority,
-    normalize_format_priority, normalize_tag_key, normalize_tag_value, record_matches_scoped,
-    record_search_sort_key_scoped,
+    AudioFormat, Category, ConvertConflictBehavior, FileRecord, FileVariant, TrimArtifactState,
+    TrimRange, WaveformBinary256, default_format_priority, normalize_format_priority,
+    normalize_tag_key, normalize_tag_value,
 };
 
 const FORMAT_PRIORITY_KEY: &str = "format_priority";
@@ -360,40 +359,14 @@ impl Database {
         Ok(fingerprints)
     }
 
-    pub fn query_visible_rows(
+    pub fn load_category_records(
         &self,
         category: Category,
-        search: &str,
-        selected: &BTreeMap<String, BTreeSet<String>>,
         priority: &[AudioFormat],
         category_folder: Option<&Path>,
     ) -> io::Result<Vec<FileRecord>> {
-        self.query_visible_rows_scoped(category, search, selected, true, priority, category_folder)
-    }
-
-    pub fn query_visible_rows_scoped(
-        &self,
-        category: Category,
-        search: &str,
-        selected: &BTreeMap<String, BTreeSet<String>>,
-        include_tags: bool,
-        priority: &[AudioFormat],
-        category_folder: Option<&Path>,
-    ) -> io::Result<Vec<FileRecord>> {
-        let selected = canonical_selected(selected);
-        let has_filter = !search.is_empty() || selected.values().any(|values| !values.is_empty());
-        let (rows, tags) = if has_filter && search.is_ascii() {
-            let stems = self.matching_stems(category, search, &selected, include_tags)?;
-            if stems.is_empty() {
-                return Ok(Vec::new());
-            }
-            (
-                self.file_rows_for_stems(category, &stems)?,
-                self.tags_for_stems(category, &stems)?,
-            )
-        } else {
-            (self.file_rows(category)?, self.tags_for_category(category)?)
-        };
+        let rows = self.file_rows(category)?;
+        let tags = self.tags_for_category(category)?;
         let rows: Vec<FileRow> = rows.into_iter().map(file_row_from_sql).collect();
         let display_names = display_names_for_rows(&rows, category_folder);
         let mut grouped: BTreeMap<String, Vec<FileVariant>> = BTreeMap::new();
@@ -437,18 +410,31 @@ impl Database {
             let record = FileRecord {
                 name,
                 path,
-                support: FileSupport::Native,
                 stem,
                 variants,
                 tags,
                 favorite,
             };
-            if record_matches_scoped(&record, search, &selected, include_tags) {
-                records.push(record);
-            }
+            records.push(record);
         }
 
-        records.sort_by_key(|record| record_search_sort_key_scoped(record, search, include_tags));
+        Ok(records)
+    }
+
+    #[cfg(test)]
+    pub fn query_visible_rows(
+        &self,
+        category: Category,
+        search: &str,
+        selected: &BTreeMap<String, BTreeSet<String>>,
+        priority: &[AudioFormat],
+        category_folder: Option<&Path>,
+    ) -> io::Result<Vec<FileRecord>> {
+        use crate::model::{record_matches_scoped, record_search_sort_key_scoped};
+
+        let mut records = self.load_category_records(category, priority, category_folder)?;
+        records.retain(|record| record_matches_scoped(record, search, selected, true));
+        records.sort_by_key(|record| record_search_sort_key_scoped(record, search, true));
         Ok(records)
     }
 
@@ -854,114 +840,6 @@ impl Database {
         .map_err(io::Error::other)
     }
 
-    fn matching_stems(
-        &self,
-        category: Category,
-        search: &str,
-        selected: &BTreeMap<String, BTreeSet<String>>,
-        include_tags: bool,
-    ) -> io::Result<Vec<String>> {
-        let mut sql = String::from(
-            "SELECT DISTINCT f.stem FROM files f
-             WHERE f.category = ?",
-        );
-        if !search.is_empty() {
-            sql.push_str(
-                " AND (lower(f.stem) LIKE ? ESCAPE '\\'
-                    OR lower(f.extension) LIKE ? ESCAPE '\\'",
-            );
-            if include_tags {
-                sql.push_str(
-                    " OR EXISTS (
-                        SELECT 1 FROM tag_values tv
-                        WHERE tv.category = f.category
-                          AND tv.stem = f.stem
-                          AND (
-                            lower(tv.key) LIKE ? ESCAPE '\\'
-                            OR lower(tv.value) LIKE ? ESCAPE '\\'
-                          )
-                    )",
-                );
-            }
-            sql.push(')');
-        }
-        for values in selected.values() {
-            for _ in values {
-                sql.push_str(
-                    " AND EXISTS (
-                        SELECT 1 FROM tag_values selected_tv
-                        WHERE selected_tv.category = f.category
-                          AND selected_tv.stem = f.stem
-                          AND lower(selected_tv.key) = lower(?)
-                          AND (
-                            selected_tv.value = ?
-                            OR selected_tv.value LIKE ? ESCAPE '\\'
-                          )
-                    )",
-                );
-            }
-        }
-        sql.push_str(" ORDER BY lower(f.stem), f.stem");
-
-        let search_pattern = like_subsequence_pattern(search);
-        let rows = block_on(async {
-            let mut query = sqlx::query(&sql).bind(category_key(category));
-            if !search.is_empty() {
-                query = query.bind(&search_pattern).bind(&search_pattern);
-                if include_tags {
-                    query = query.bind(&search_pattern).bind(&search_pattern);
-                }
-            }
-            for (key, values) in selected {
-                for value in values {
-                    query = query
-                        .bind(key)
-                        .bind(value)
-                        .bind(like_descendant_pattern(value));
-                }
-            }
-            query.fetch_all(&self.pool).await
-        })
-        .map_err(io::Error::other)?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| row.get::<String, _>("stem"))
-            .collect())
-    }
-
-    fn file_rows_for_stems(
-        &self,
-        category: Category,
-        stems: &[String],
-    ) -> io::Result<Vec<sqlx::sqlite::SqliteRow>> {
-        let mut rows = Vec::new();
-        for chunk in stems.chunks(500) {
-            let placeholders = placeholders(chunk.len());
-            let sql = format!(
-                "SELECT f.path, f.stem, f.extension, f.size, f.modified, f.first_seen_at,
-                        f.preview_waveform, t.start_ratio, t.end_ratio, t.artifact_path,
-                        t.source_size, t.source_modified, t.artifact_start_ratio,
-                        t.artifact_end_ratio,
-                        EXISTS (SELECT 1 FROM favorites fav WHERE fav.path = f.path) AS favorite
-                 FROM files f
-                 LEFT JOIN trims t ON t.source_path = f.path
-                 WHERE f.category = ? AND f.stem IN ({placeholders})
-                 ORDER BY f.stem, f.extension"
-            );
-            let chunk_rows = block_on(async {
-                let mut query = sqlx::query(&sql).bind(category_key(category));
-                for stem in chunk {
-                    query = query.bind(stem);
-                }
-                query.fetch_all(&self.pool).await
-            })
-            .map_err(io::Error::other)?;
-            rows.extend(chunk_rows);
-        }
-        Ok(rows)
-    }
-
     fn tags_for_category(
         &self,
         category: Category,
@@ -978,32 +856,6 @@ impl Database {
         })
         .map_err(io::Error::other)?;
         Ok(collect_tags(rows))
-    }
-
-    fn tags_for_stems(
-        &self,
-        category: Category,
-        stems: &[String],
-    ) -> io::Result<BTreeMap<String, BTreeMap<String, Vec<String>>>> {
-        let mut tag_rows = Vec::new();
-        for chunk in stems.chunks(500) {
-            let placeholders = placeholders(chunk.len());
-            let sql = format!(
-                "SELECT stem, key, value FROM tag_values
-                 WHERE category = ? AND stem IN ({placeholders})
-                 ORDER BY key COLLATE NOCASE, value COLLATE NOCASE"
-            );
-            let rows = block_on(async {
-                let mut query = sqlx::query(&sql).bind(category_key(category));
-                for stem in chunk {
-                    query = query.bind(stem);
-                }
-                query.fetch_all(&self.pool).await
-            })
-            .map_err(io::Error::other)?;
-            tag_rows.extend(rows);
-        }
-        Ok(collect_tags(tag_rows))
     }
 
     fn setting(&self, key: &str) -> io::Result<Option<String>> {
@@ -1088,15 +940,6 @@ fn current_unix_millis() -> i64 {
         .unwrap_or_default()
 }
 
-fn metadata_modified_secs(metadata: &fs::Metadata) -> i64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
-}
-
 fn sort_variants(variants: &mut [FileVariant], priority: &[AudioFormat]) {
     variants.sort_by(|a, b| {
         priority_index(&a.extension, priority)
@@ -1153,7 +996,12 @@ fn file_row_from_sql(row: sqlx::sqlite::SqliteRow) -> FileRow {
             .map(|(size, modified)| (size as u64, modified));
         let current_fingerprint = fs::metadata(&path)
             .ok()
-            .map(|metadata| (metadata.len(), metadata_modified_secs(&metadata)))
+            .map(|metadata| {
+                (
+                    metadata.len(),
+                    crate::fs_utils::modified_unix_seconds(&metadata),
+                )
+            })
             .unwrap_or_else(|| {
                 (
                     row.get::<i64, _>("size") as u64,
@@ -1262,20 +1110,6 @@ fn category_key(category: Category) -> &'static str {
     }
 }
 
-fn placeholders(len: usize) -> String {
-    std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
-}
-
-fn like_subsequence_pattern(value: &str) -> String {
-    let mut pattern = String::with_capacity(value.len() * 2 + 1);
-    pattern.push('%');
-    for ch in value.to_lowercase().chars() {
-        push_escaped_like_char(&mut pattern, ch);
-        pattern.push('%');
-    }
-    pattern
-}
-
 fn like_descendant_pattern(value: &str) -> String {
     let mut pattern = String::with_capacity(value.len() + 2);
     for ch in value.chars() {
@@ -1312,20 +1146,6 @@ fn folder_tag_values(category_folder: &Path, path: &Path) -> Vec<String> {
         }
     }
     values
-}
-
-fn canonical_selected(
-    selected: &BTreeMap<String, BTreeSet<String>>,
-) -> BTreeMap<String, BTreeSet<String>> {
-    let mut out = BTreeMap::new();
-    for (key, values) in selected {
-        if let Some(key) = normalize_tag_key(key) {
-            out.entry(key.to_string())
-                .or_insert_with(BTreeSet::new)
-                .extend(values.iter().filter_map(|value| normalize_tag_value(value)));
-        }
-    }
-    out
 }
 
 #[cfg(test)]

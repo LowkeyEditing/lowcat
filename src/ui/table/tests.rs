@@ -205,7 +205,6 @@ fn favorite_target_uses_all_favorite_rule_and_every_variant_path() {
     let record = |name: &str, favorite: bool| FileRecord {
         name: name.to_string(),
         path: PathBuf::from(format!("/tmp/{name}.wav")),
-        support: crate::model::FileSupport::Native,
         stem: name.to_string(),
         variants: vec![crate::model::FileVariant {
             path: PathBuf::from(format!("/tmp/{name}.wav")),

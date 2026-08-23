@@ -159,17 +159,9 @@ fn is_dropped_link_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_link_path(extension: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!(
-            "lowcat-dropped-link-{}-{nanos}.{extension}",
-            std::process::id()
-        ))
+        crate::test_support::unique_path("dropped-link").with_extension(extension)
     }
 
     #[test]

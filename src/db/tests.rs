@@ -1,22 +1,8 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::model::FolderTagAssignment;
 
 fn db_path(name: &str) -> PathBuf {
-    static NEXT_DB_PATH: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir()
-        .join(format!(
-            "lowcat-db-{name}-{}-{nanos}-{}",
-            std::process::id(),
-            NEXT_DB_PATH.fetch_add(1, Ordering::Relaxed)
-        ))
-        .join("library.sqlite")
+    crate::test_support::unique_path(&format!("db-{name}")).join("library.sqlite")
 }
 
 fn scan(name: &str, tags: &[(&str, &[&str])]) -> FileScanRecord {

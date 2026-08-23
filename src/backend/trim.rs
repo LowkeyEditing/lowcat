@@ -3,7 +3,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{AudioFormat, Category, FileVariant, TrimRange};
 
@@ -83,7 +82,7 @@ impl Backend {
             destination,
             &artifact_path,
             metadata.len(),
-            modified_secs(&metadata),
+            crate::fs_utils::modified_unix_seconds(&metadata),
         )
     }
 
@@ -95,7 +94,7 @@ impl Backend {
             destination,
             &artifact_path,
             metadata.len(),
-            modified_secs(&metadata),
+            crate::fs_utils::modified_unix_seconds(&metadata),
         )
     }
 
@@ -109,7 +108,7 @@ impl Backend {
         if initial != (request.source_size, request.source_modified) {
             return Err(io::Error::other("trim source changed before generation"));
         }
-        let duration = media_duration_seconds(&request.source_path)
+        let duration = crate::media_tools::probe_duration_seconds(&request.source_path)
             .ok_or_else(|| io::Error::other("could not read trim source duration"))?;
         let start = duration * request.range.start_ratio as f64;
         let selected_duration =
@@ -130,7 +129,11 @@ impl Backend {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "unsupported trim format")
             })?;
-        let temp_path = unique_temp_path(&self.trims_dir, extension.extension());
+        let temp_path = crate::fs_utils::unique_path(
+            &self.trims_dir,
+            ".lowcat-trim",
+            Some(extension.extension()),
+        );
         let output_args: &[&str] = match extension {
             AudioFormat::Mp3 => &["-vn", "-c:a", "libmp3lame", "-q:a", "2", "-y"],
             AudioFormat::Wav => &["-vn", "-c:a", "pcm_s16le", "-y"],
@@ -227,29 +230,6 @@ impl Backend {
     }
 }
 
-fn media_duration_seconds(path: &Path) -> Option<f64> {
-    let output = crate::media_tools::command("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let duration = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<f64>()
-        .ok()?;
-    (duration.is_finite() && duration > 0.).then_some(duration)
-}
-
 fn stable_path_hash(path: &Path) -> u64 {
     path.as_os_str()
         .as_encoded_bytes()
@@ -259,29 +239,12 @@ fn stable_path_hash(path: &Path) -> u64 {
         })
 }
 
-fn unique_temp_path(folder: &Path, extension: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    folder.join(format!(
-        ".lowcat-trim-{}-{nanos}.{extension}",
-        std::process::id()
-    ))
-}
-
 fn source_fingerprint(path: &Path) -> io::Result<(u64, i64)> {
     let metadata = fs::metadata(path)?;
-    Ok((metadata.len(), modified_secs(&metadata)))
-}
-
-fn modified_secs(metadata: &fs::Metadata) -> i64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
+    Ok((
+        metadata.len(),
+        crate::fs_utils::modified_unix_seconds(&metadata),
+    ))
 }
 
 fn remove_file_if_present(path: &Path) -> io::Result<()> {

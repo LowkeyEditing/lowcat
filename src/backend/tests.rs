@@ -1,11 +1,7 @@
 use super::*;
 use std::fs::File;
 use std::process::{Command, Stdio};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
 
 use lofty::config::ParseOptions;
 use lofty::file::AudioFile;
@@ -14,18 +10,7 @@ use lofty::flac::FlacFile;
 use crate::model::{TrimArtifactState, TrimRange};
 
 fn unique_dir(name: &str) -> PathBuf {
-    static NEXT_UNIQUE_DIR: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "lowcat-backend-{name}-{}-{nanos}-{}",
-        std::process::id(),
-        NEXT_UNIQUE_DIR.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&path).unwrap();
-    path
+    crate::test_support::unique_dir(&format!("backend-{name}"))
 }
 
 fn unique_db(name: &str) -> PathBuf {
@@ -91,24 +76,7 @@ fn duration_fixture(dir: &Path, name: &str, duration: f64) -> PathBuf {
 }
 
 fn probed_duration(path: &Path) -> f64 {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
+    crate::media_tools::probe_duration_seconds(path).expect("ffprobe must read fixture duration")
 }
 
 #[test]

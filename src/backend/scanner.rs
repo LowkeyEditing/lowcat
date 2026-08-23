@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io;
 use std::path::Path;
-use std::time::UNIX_EPOCH;
 
 use lofty::config::ParseOptions;
 use lofty::file::AudioFile;
@@ -87,7 +86,7 @@ fn read_scan_record_cached(
 ) -> io::Result<FileScanRecord> {
     let metadata = fs::metadata(path)?;
     let size = metadata.len();
-    let modified = modified_secs(&metadata);
+    let modified = crate::fs_utils::modified_unix_seconds(&metadata);
     let path_key = path.to_string_lossy().to_string();
     let unchanged = fingerprints
         .get(&path_key)
@@ -111,15 +110,6 @@ fn read_scan_record_cached(
         modified,
         tags,
     })
-}
-
-fn modified_secs(metadata: &fs::Metadata) -> i64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
 }
 
 pub(super) fn file_stem(path: &Path) -> String {

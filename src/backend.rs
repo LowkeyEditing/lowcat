@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::db::Database;
 use crate::model::{
     AudioFormat, Category, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
-    WaveformBinary256,
+    WaveformBinary256, unique_paths,
 };
 
 mod conversion;
@@ -62,31 +62,28 @@ impl Backend {
 
     pub fn refresh_category(&mut self, category: Category) -> io::Result<()> {
         let refresh_start = crate::perf::start();
-        let Some(folder) = self.folders.get(&category) else {
-            let summary = self.db.sync_category(category, Vec::new())?;
-            self.reconcile_trim_records(category)?;
-            crate::perf::finish("backend.refresh_category", refresh_start, || {
-                format!(
-                    "category={} records=0 missing_folder=true removed={}",
-                    category.label(),
-                    summary.removed
-                )
-            });
-            return Ok(());
+        let empty_reason = match self.folders.get(&category) {
+            None => Some("missing_folder"),
+            Some(folder) if !folder.is_dir() => Some("invalid_folder"),
+            Some(_) => None,
         };
-
-        if !folder.is_dir() {
+        if let Some(reason) = empty_reason {
             let summary = self.db.sync_category(category, Vec::new())?;
             self.reconcile_trim_records(category)?;
             crate::perf::finish("backend.refresh_category", refresh_start, || {
                 format!(
-                    "category={} records=0 invalid_folder=true removed={}",
+                    "category={} records=0 {reason}=true removed={}",
                     category.label(),
                     summary.removed
                 )
             });
             return Ok(());
         }
+
+        let folder = self
+            .folders
+            .get(&category)
+            .expect("valid category folder was checked above");
 
         let fingerprints = self.db.file_fingerprints(category)?;
         let scan = scan_category_folder(category, folder, &fingerprints)?;
@@ -111,24 +108,33 @@ impl Backend {
         Ok(())
     }
 
-    pub fn filter(
-        &self,
-        category: Category,
-        search: &str,
-        selected: &BTreeMap<String, BTreeSet<String>>,
-    ) -> Vec<FileRecord> {
+    pub fn load_category_records(&self, category: Category) -> Vec<FileRecord> {
         let category_folder = self.folders.get(&category).map(PathBuf::as_path);
         self.db
-            .query_visible_rows(
+            .load_category_records(
                 category,
-                search,
-                selected,
                 &self
                     .format_priority()
                     .unwrap_or_else(|_| crate::model::default_format_priority()),
                 category_folder,
             )
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn filter(
+        &self,
+        category: Category,
+        search: &str,
+        selected: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Vec<FileRecord> {
+        let mut records = self.load_category_records(category);
+        records
+            .retain(|record| crate::model::record_matches_scoped(record, search, selected, true));
+        records.sort_by_key(|record| {
+            crate::model::record_search_sort_key_scoped(record, search, true)
+        });
+        records
     }
 
     pub fn schema_for(&self, category: Category) -> BTreeMap<String, Vec<String>> {
@@ -338,11 +344,7 @@ impl Backend {
 }
 
 fn trash_files(paths: Vec<PathBuf>) -> io::Result<usize> {
-    let mut seen = BTreeSet::new();
-    let paths: Vec<PathBuf> = paths
-        .into_iter()
-        .filter(|path| seen.insert(path.clone()))
-        .collect();
+    let paths = unique_paths(paths);
     let path_count = paths.len();
     if path_count == 0 {
         return Ok(0);

@@ -201,15 +201,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Stdio;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn decodes_and_seeks_ogg_opus() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("lowcat-opus-source-{unique}.opus"));
+        let path = crate::test_support::unique_path("opus-source").with_extension("opus");
         let status = crate::media_tools::command("ffmpeg")
             .args([
                 "-hide_banner",

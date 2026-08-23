@@ -2,7 +2,6 @@ use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{AudioFormat, ConvertConflictBehavior};
 
@@ -25,7 +24,7 @@ pub(crate) fn import_to_folder(
             "source is not a file",
         ));
     }
-    if !probe_is_audio(source) {
+    if !crate::media_tools::has_audio_stream(source) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "source is not readable audio",
@@ -46,7 +45,7 @@ pub(crate) fn import_to_folder(
         .unwrap_or("import");
 
     let final_path = unique_destination(folder, stem, &extension);
-    let temp_path = temp_destination(folder, &extension);
+    let temp_path = crate::fs_utils::unique_path(folder, ".lowcat-import", Some(&extension));
 
     on_conversion_progress(100.);
     let produced = fs::copy(source, &temp_path).map(|_| ());
@@ -64,24 +63,6 @@ pub(crate) fn import_to_folder(
     Ok(final_path)
 }
 
-fn probe_is_audio(path: &Path) -> bool {
-    crate::media_tools::command("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .map(|output| output.status.success() && !output.stdout.is_empty())
-        .unwrap_or(false)
-}
-
 pub(super) fn convert_file_to_format(
     source: &Path,
     folder: &Path,
@@ -95,7 +76,7 @@ pub(super) fn convert_file_to_format(
             "source is not a file",
         ));
     }
-    if !probe_is_audio(source) {
+    if !crate::media_tools::has_audio_stream(source) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "source is not readable audio",
@@ -107,7 +88,8 @@ pub(super) fn convert_file_to_format(
         .and_then(|stem| stem.to_str())
         .unwrap_or("converted");
     let final_path = conversion_destination(folder, stem, target.extension(), behavior);
-    let temp_path = temp_destination(folder, target.extension());
+    let temp_path =
+        crate::fs_utils::unique_path(folder, ".lowcat-import", Some(target.extension()));
     let output_args: &[&str] = match target {
         AudioFormat::Mp3 => &["-vn", "-c:a", "libmp3lame", "-q:a", "2", "-y"],
         AudioFormat::Wav => &["-vn", "-c:a", "pcm_s16le", "-y"],
@@ -138,7 +120,8 @@ fn convert_media(
     output_args: &[&str],
     mut on_progress: impl FnMut(f32),
 ) -> io::Result<()> {
-    let duration_us = media_duration_us(source);
+    let duration_us =
+        crate::media_tools::probe_duration_seconds(source).map(|seconds| seconds * 1_000_000.);
     on_progress(0.);
     let mut child = crate::media_tools::command("ffmpeg")
         .args([
@@ -170,29 +153,6 @@ fn convert_media(
     } else {
         Err(io::Error::other("ffmpeg conversion failed"))
     }
-}
-
-fn media_duration_us(path: &Path) -> Option<f64> {
-    let output = crate::media_tools::command("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let seconds = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<f64>()
-        .ok()?;
-    (seconds.is_finite() && seconds > 0.).then_some(seconds * 1_000_000.)
 }
 
 fn parse_ffmpeg_progress(line: &str, duration_us: Option<f64>) -> Option<f32> {
@@ -237,15 +197,4 @@ fn conversion_destination(
         ConvertConflictBehavior::Overwrite => folder.join(format!("{stem}.{extension}")),
         ConvertConflictBehavior::AddCopy => unique_destination(folder, stem, extension),
     }
-}
-
-fn temp_destination(folder: &Path, extension: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    folder.join(format!(
-        ".lowcat-import-{}-{nanos}.{extension}",
-        std::process::id()
-    ))
 }

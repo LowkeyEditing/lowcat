@@ -11,7 +11,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use crate::model::{AudioFormat, Category};
@@ -459,11 +459,7 @@ fn cleanup_temp_dir(temp_dir: &std::path::Path) {
 }
 
 fn temp_download_dir(folder: &std::path::Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    folder.join(format!(".lowcat-download-{}-{nanos}", std::process::id()))
+    crate::fs_utils::unique_path(folder, ".lowcat-download", None)
 }
 
 fn normalize_youtube_url(token: &str) -> Option<String> {

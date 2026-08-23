@@ -163,16 +163,6 @@ impl UI {
             .update(cx, |table, cx| table.cancel_tag_edit(window, cx))
     }
 
-    fn cancel_column_visibility_menu(&mut self, cx: &mut Context<Self>) -> bool {
-        self.table
-            .update(cx, |table, cx| table.cancel_column_visibility_menu(cx))
-    }
-
-    fn cancel_tag_group_menu(&mut self, cx: &mut Context<Self>) -> bool {
-        self.filter_panel
-            .update(cx, |panel, cx| panel.cancel_tag_group_menu(cx))
-    }
-
     fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
         self.table.update(cx, |table, cx| table.clear_selection(cx))
     }
@@ -299,8 +289,6 @@ impl UI {
             if self.cancel_rename(window, cx)
                 || self.cancel_delete(cx)
                 || self.cancel_tag_edit(window, cx)
-                || self.cancel_column_visibility_menu(cx)
-                || self.cancel_tag_group_menu(cx)
                 || self.cancel_search_if_no_selection(window, cx)
                 || self.clear_selection(cx)
             {

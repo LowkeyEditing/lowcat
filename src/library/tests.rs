@@ -1,24 +1,11 @@
 use super::*;
-use crate::model::{FileSupport, FileVariant};
+use crate::model::FileVariant;
 use std::fs;
 use std::process::{Command, Stdio};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
 
 fn unique_path(name: &str) -> PathBuf {
-    static NEXT_UNIQUE_PATH: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "lowcat-{name}-{}-{nanos}-{}",
-        std::process::id(),
-        NEXT_UNIQUE_PATH.fetch_add(1, Ordering::Relaxed)
-    ))
+    crate::test_support::unique_path(name)
 }
 
 fn category_dir(name: &str) -> PathBuf {
@@ -45,7 +32,6 @@ fn sort_fixture(name: &str, tags: &[(&str, &[&str])]) -> FileRecord {
     FileRecord {
         name: name.to_string(),
         path: PathBuf::from(format!("/tmp/{name}")),
-        support: FileSupport::Native,
         stem: name.to_string(),
         variants: vec![FileVariant {
             path: PathBuf::from(format!("/tmp/{name}")),

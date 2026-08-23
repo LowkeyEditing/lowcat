@@ -31,18 +31,11 @@ pub struct Library {
     backend: Backend,
     active: Category,
     states: BTreeMap<Category, CategoryState>,
-    settings: config::Settings,
-    settings_path: PathBuf,
+    settings: config::SettingsStore,
     format_priority: Vec<AudioFormat>,
-    download_format: AudioFormat,
-    preview_volume: f32,
     convert_conflict_behavior: ConvertConflictBehavior,
-    filters_open: bool,
-    hidden_tag_keys: BTreeSet<String>,
-    hidden_tag_column_keys: BTreeSet<String>,
-    intersection_tags: BTreeMap<Category, BTreeMap<String, BTreeSet<String>>>,
+    open_panel: Option<OpenPanel>,
     tag_intersections: TagIntersections,
-    downloader_open: bool,
     download_state: DownloadState,
     download_cancel: Option<DownloadCancel>,
     internal_file_drag: Option<InternalFileDrag>,
@@ -64,6 +57,12 @@ pub struct Library {
     table_revision: u64,
     filter_panel_revision: u64,
     search_generation: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenPanel {
+    Filters,
+    Downloader,
 }
 
 #[derive(Clone)]
@@ -95,7 +94,7 @@ pub struct ImportProgress {
 impl Library {
     pub fn new_for_app(cx: &mut Context<Self>) -> Self {
         let mut this = Self::new_uninitialized(config::settings_path());
-        let mut preview_player = PreviewPlayer::new(this.preview_volume);
+        let mut preview_player = PreviewPlayer::new(this.preview_volume());
         if let Err(error) = preview_player.warm_up() {
             eprintln!("lowcat preview player warm-up failed error={error}");
         }
@@ -113,8 +112,8 @@ impl Library {
     }
 
     fn new_uninitialized(settings_path: PathBuf) -> Self {
-        let settings = config::Settings::load(&settings_path);
-        let backend = Backend::new(database_path_for_settings(&settings_path))
+        let settings = config::SettingsStore::load(settings_path);
+        let backend = Backend::new(database_path_for_settings(settings.path()))
             .expect("failed to initialize Lowcat SQLite database");
         let format_priority = backend
             .format_priority()
@@ -122,30 +121,15 @@ impl Library {
         let convert_conflict_behavior = backend
             .convert_conflict_behavior()
             .unwrap_or(ConvertConflictBehavior::AddCopy);
-        let download_format = settings.download_format();
-        let preview_volume = settings.preview_volume();
-        let hidden_tag_keys = settings.hidden_tag_groups();
-        let hidden_tag_column_keys = settings.hidden_tag_columns();
-        let intersection_tags = Category::ALL
-            .into_iter()
-            .map(|category| (category, settings.intersection_tags(category)))
-            .collect();
         Self {
             backend,
             active: Category::Music,
             states: BTreeMap::new(),
             settings,
-            settings_path,
             format_priority,
-            download_format,
-            preview_volume,
             convert_conflict_behavior,
-            filters_open: false,
-            hidden_tag_keys,
-            hidden_tag_column_keys,
-            intersection_tags,
+            open_panel: None,
             tag_intersections: BTreeMap::new(),
-            downloader_open: false,
             download_state: DownloadState::Idle,
             download_cancel: None,
             internal_file_drag: None,
@@ -223,7 +207,7 @@ impl Library {
     }
 
     pub fn filters_open(&self) -> bool {
-        self.filters_open
+        matches!(self.open_panel, Some(OpenPanel::Filters))
     }
 
     pub fn favorites_only(&self) -> bool {
@@ -296,9 +280,8 @@ impl Library {
 
     pub(crate) fn record_is_recently_imported(&self, record: &FileRecord) -> bool {
         record
-            .variants
-            .iter()
-            .any(|variant| self.recent_import_paths.contains(&variant.path))
+            .variant_paths()
+            .any(|path| self.recent_import_paths.contains(path))
     }
 
     fn clear_import_priority(&mut self) {
@@ -323,17 +306,17 @@ impl Library {
     }
 
     pub fn tag_group_is_visible(&self, key: &str) -> bool {
-        !self.hidden_tag_keys.contains(key)
+        !self.settings.hidden_tag_groups().contains(key)
     }
 
     pub fn hidden_tag_column_keys(&self) -> BTreeSet<String> {
-        self.hidden_tag_column_keys.clone()
+        self.settings.hidden_tag_columns()
     }
 
     pub fn tag_shows_on_intersection(&self, key: &str, value: &str) -> bool {
-        self.intersection_tags
-            .get(&self.active)
-            .and_then(|tags| tags.get(key))
+        self.settings
+            .intersection_tags(self.active)
+            .get(key)
             .is_some_and(|values| values.contains(value))
     }
 
@@ -365,11 +348,7 @@ impl Library {
         cx: &mut Context<Self>,
     ) {
         let category = self.active;
-        let mut tags = self
-            .intersection_tags
-            .get(&category)
-            .cloned()
-            .unwrap_or_default();
+        let mut tags = self.settings.intersection_tags(category);
         let values = tags.entry(key.to_string()).or_default();
         if !values.remove(value) {
             values.insert(value.to_string());
@@ -387,12 +366,9 @@ impl Library {
         category: Category,
         tags: BTreeMap<String, BTreeSet<String>>,
     ) {
-        let mut settings = self.settings.clone();
-        settings.set_intersection_tags(category, tags.clone());
-        if settings.save(&self.settings_path).is_ok() {
-            self.settings = settings;
-            self.intersection_tags.insert(category, tags);
-        }
+        let _ = self
+            .settings
+            .update(|settings| settings.set_intersection_tags(category, tags));
     }
 
     pub fn format_priority(&self) -> &[AudioFormat] {
@@ -400,7 +376,7 @@ impl Library {
     }
 
     pub fn download_format(&self) -> AudioFormat {
-        self.download_format
+        self.settings.download_format()
     }
 
     pub fn convert_conflict_behavior(&self) -> ConvertConflictBehavior {
@@ -408,20 +384,20 @@ impl Library {
     }
 
     pub fn toggle_filters(&mut self, cx: &mut Context<Self>) {
-        self.filters_open = !self.filters_open;
-        if self.filters_open {
-            self.downloader_open = false;
-        }
+        self.open_panel = match self.open_panel {
+            Some(OpenPanel::Filters) => None,
+            _ => Some(OpenPanel::Filters),
+        };
         self.clear_import_priority();
         self.refresh_search_results(self.active);
         cx.notify();
     }
 
     pub fn close_filters(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.filters_open {
+        if !self.filters_open() {
             return false;
         }
-        self.filters_open = false;
+        self.open_panel = None;
         self.clear_import_priority();
         self.refresh_search_results(self.active);
         cx.notify();
@@ -429,16 +405,16 @@ impl Library {
     }
 
     pub fn toggle_downloader(&mut self, cx: &mut Context<Self>) {
-        self.downloader_open = !self.downloader_open;
-        if self.downloader_open {
-            let filters_were_open = self.filters_open;
-            self.filters_open = false;
-            if filters_were_open {
-                self.clear_import_priority();
-                self.refresh_search_results(self.active);
-            }
+        let filters_were_open = self.filters_open();
+        self.open_panel = match self.open_panel {
+            Some(OpenPanel::Downloader) => None,
+            _ => Some(OpenPanel::Downloader),
+        };
+        if filters_were_open {
+            self.clear_import_priority();
+            self.refresh_search_results(self.active);
         }
-        debug_downloader_interaction(|| format!("panel_open={}", self.downloader_open));
+        debug_downloader_interaction(|| format!("panel_open={}", self.downloader_open()));
         cx.notify();
     }
 
@@ -493,7 +469,7 @@ impl Library {
                 state.favorites_only,
             )
         };
-        let include_tags = self.filters_open;
+        let include_tags = self.filters_open();
         let sort = self.states[&category].sort.clone();
         let recent_import_paths = self.recent_import_paths.clone();
         let search_for_task = search.clone();
@@ -566,7 +542,7 @@ impl Library {
     }
 
     pub fn toggle_tag_group_visibility(&mut self, key: &str, cx: &mut Context<Self>) {
-        let mut keys = self.hidden_tag_keys.clone();
+        let mut keys = self.settings.hidden_tag_groups();
         if !keys.remove(key) {
             keys.insert(key.to_string());
         }
@@ -574,18 +550,18 @@ impl Library {
     }
 
     pub fn set_hidden_tag_groups(&mut self, keys: BTreeSet<String>, cx: &mut Context<Self>) {
-        let mut settings = self.settings.clone();
-        settings.set_hidden_tag_groups(keys.clone());
-        if settings.save(&self.settings_path).is_ok() {
-            self.settings = settings;
-            self.hidden_tag_keys = keys;
+        if self
+            .settings
+            .update(|settings| settings.set_hidden_tag_groups(keys))
+            .is_ok()
+        {
             self.bump_filter_panel_revision();
         }
         cx.notify();
     }
 
     pub fn show_all_tag_groups(&mut self, cx: &mut Context<Self>) {
-        if self.hidden_tag_keys.is_empty() {
+        if self.settings.hidden_tag_groups().is_empty() {
             return;
         }
         self.set_hidden_tag_groups(BTreeSet::new(), cx);
@@ -596,12 +572,9 @@ impl Library {
     }
 
     pub fn set_hidden_tag_column_keys(&mut self, keys: BTreeSet<String>, cx: &mut Context<Self>) {
-        let mut settings = self.settings.clone();
-        settings.set_hidden_tag_columns(keys.clone());
-        if settings.save(&self.settings_path).is_ok() {
-            self.settings = settings;
-            self.hidden_tag_column_keys = keys;
-        }
+        let _ = self
+            .settings
+            .update(|settings| settings.set_hidden_tag_columns(keys));
         cx.notify();
     }
 
@@ -1020,38 +993,34 @@ impl Library {
     }
 
     pub fn set_download_format(&mut self, format: AudioFormat, cx: &mut Context<Self>) {
-        if self.download_format == format {
+        if self.download_format() == format {
             cx.notify();
             return;
         }
 
-        let mut settings = self.settings.clone();
-        settings.set_download_format(format);
-        if settings.save(&self.settings_path).is_ok() {
-            self.settings = settings;
-            self.download_format = format;
-        }
+        let _ = self
+            .settings
+            .update(|settings| settings.set_download_format(format));
         cx.notify();
     }
 
     pub fn preview_volume(&self) -> f32 {
-        self.preview_volume
+        self.settings.preview_volume()
     }
 
     pub fn set_preview_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
         let volume = volume.clamp(0., 1.);
-        if self.preview_volume == volume {
+        if self.preview_volume() == volume {
             return;
         }
 
-        let mut settings = self.settings.clone();
-        settings.set_preview_volume(volume);
-        if settings.save(&self.settings_path).is_ok() {
-            self.settings = settings;
-            self.preview_volume = volume;
-            if let Some(player) = self.preview_player.as_mut() {
-                player.set_volume(volume);
-            }
+        if self
+            .settings
+            .update(|settings| settings.set_preview_volume(volume))
+            .is_ok()
+            && let Some(player) = self.preview_player.as_mut()
+        {
+            player.set_volume(volume);
         }
         cx.notify();
     }
@@ -1095,13 +1064,7 @@ impl Library {
             .active_state()
             .all_records
             .iter()
-            .find(|record| {
-                record.path == row_path
-                    || record
-                        .variants
-                        .iter()
-                        .any(|variant| variant.path == row_path)
-            })
+            .find(|record| record.contains_path(row_path))
             .map(|record| record.variants.clone());
         let Some(variants) = variants else {
             return;
@@ -1128,20 +1091,8 @@ impl Library {
             .active_state()
             .all_records
             .iter()
-            .find(|record| {
-                record.path == row_path
-                    || record
-                        .variants
-                        .iter()
-                        .any(|variant| variant.path == row_path)
-            })
-            .map(|record| {
-                record
-                    .variants
-                    .iter()
-                    .map(|variant| variant.path.clone())
-                    .collect::<Vec<_>>()
-            })
+            .find(|record| record.contains_path(row_path))
+            .map(|record| record.variant_paths().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         if paths.is_empty() {
             return;
@@ -1168,7 +1119,7 @@ impl Library {
                     .states
                     .values()
                     .flat_map(|state| state.all_records.iter())
-                    .find(|record| record.variants.iter().any(|variant| variant.path == *path));
+                    .find(|record| record.contains_path(path));
                 let Some(record) = record else {
                     return Ok(path.clone());
                 };
@@ -1225,7 +1176,7 @@ impl Library {
         );
 
         let source_path = request.source_path.clone();
-        let db_path = database_path_for_settings(&self.settings_path);
+        let db_path = database_path_for_settings(self.settings.path());
         let task = cx.background_spawn(async move {
             let backend = Backend::new(db_path)?;
             backend.generate_trim_artifact(&request, &gate, token)
@@ -1330,10 +1281,8 @@ impl Library {
         path: PathBuf,
         cx: &mut Context<Self>,
     ) -> io::Result<()> {
-        let mut settings = self.settings.clone();
-        settings.set_category_folder(category, path.clone());
-        settings.save(&self.settings_path)?;
-        self.settings = settings;
+        self.settings
+            .update(|settings| settings.set_category_folder(category, path.clone()))?;
         self.backend.set_category_folder(category, path)?;
         self.clear_import_priority();
         self.refresh_category_state(category);
@@ -1356,7 +1305,7 @@ impl Library {
         self.last_focus_rescan = Some(now);
         self.focus_rescan_in_flight = true;
         let settings = self.settings.clone();
-        let db_path = database_path_for_settings(&self.settings_path);
+        let db_path = database_path_for_settings(settings.path());
         let started_at = Instant::now();
 
         let rescan_task = cx.background_spawn(async move {
@@ -1480,15 +1429,12 @@ impl Library {
         let schema_start = crate::perf::start();
         let schema = display_schema(self.backend.schema_for(category));
         let all_records = display_records(
-            self.backend.filter(category, "", &BTreeMap::new()),
+            self.backend.load_category_records(category),
             &self.trim_generations,
         );
         let intersections = tag_intersections(&all_records);
-        let mut configured = self
-            .intersection_tags
-            .get(&category)
-            .cloned()
-            .unwrap_or_default();
+        let mut configured = self.settings.intersection_tags(category);
+        let original_configured = configured.clone();
         configured.retain(|key, values| {
             values.retain(|value| {
                 intersections
@@ -1497,7 +1443,7 @@ impl Library {
             });
             !values.is_empty()
         });
-        if self.intersection_tags.get(&category) != Some(&configured) {
+        if configured != original_configured {
             self.save_intersection_tags(category, configured);
         }
         self.tag_intersections.insert(category, intersections);
@@ -1512,7 +1458,7 @@ impl Library {
             &all_records,
             &search,
             &selected,
-            self.filters_open,
+            self.filters_open(),
             favorites_only,
             &sort,
             &self.recent_import_paths,
@@ -1566,7 +1512,7 @@ impl Library {
             &all_records,
             &search,
             &selected,
-            self.filters_open,
+            self.filters_open(),
             favorites_only,
             &sort,
             &self.recent_import_paths,
@@ -1645,7 +1591,7 @@ impl Library {
     fn load_category_state(&self, category: Category) -> CategoryState {
         let schema = display_schema(self.backend.schema_for(category));
         let all_records = Arc::new(display_records(
-            self.backend.filter(category, "", &BTreeMap::new()),
+            self.backend.load_category_records(category),
             &self.trim_generations,
         ));
         let results = all_records.as_ref().clone();
@@ -1732,9 +1678,8 @@ fn record_is_recently_imported(
     recent_import_paths: &BTreeSet<PathBuf>,
 ) -> bool {
     record
-        .variants
-        .iter()
-        .any(|variant| recent_import_paths.contains(&variant.path))
+        .variant_paths()
+        .any(|path| recent_import_paths.contains(path))
 }
 
 fn compare_sort_values(left: &FileRecord, right: &FileRecord, sort: &SortState) -> Ordering {
@@ -1867,7 +1812,6 @@ fn display_record(
     FileRecord {
         name: record.name,
         path: record.path,
-        support: record.support,
         stem: record.stem,
         variants,
         tags: display_schema(record.tags),

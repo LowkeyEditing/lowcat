@@ -1,6 +1,7 @@
 mod native_drag;
 mod preview_waveform;
 mod render;
+mod selection;
 
 #[cfg(test)]
 mod tests;
@@ -16,13 +17,13 @@ use std::sync::{
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, AsyncApp, Bounds, ClickEvent, Context, CursorStyle,
+    AnyElement, App, AppContext as _, AsyncApp, Bounds, ClickEvent, Context, CursorStyle,
     DismissEvent, DispatchPhase, Element, ElementId, Entity, FocusHandle, Focusable,
     GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement as _,
     IntoElement, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString, Size,
-    StatefulInteractiveElement as _, Style, Styled, Window, anchored, canvas, deferred, div, fill,
-    hsla, point, prelude::FluentBuilder as _, px, red, relative, size, white,
+    StatefulInteractiveElement as _, Style, Styled, Window, canvas, div, fill, hsla, point,
+    prelude::FluentBuilder as _, px, red, relative, size, white,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable, StyledExt, VirtualListScrollHandle, WindowExt as _,
@@ -34,6 +35,9 @@ use gpui_component::{
     v_virtual_list,
 };
 
+use self::selection::{
+    extension_paths, primary_paths, records_for_path, selected_records, variant_paths,
+};
 use crate::ui::CONTENT_PX;
 use crate::{
     backend::RenameRecord,
@@ -208,6 +212,7 @@ struct SelectedRowsActions {
 
 struct SelectedRowsActionsCache {
     table_revision: u64,
+    selection: BTreeSet<PathBuf>,
     actions: Arc<SelectedRowsActions>,
 }
 
@@ -316,12 +321,6 @@ pub(crate) enum PendingRenameKind {
     Rows,
     TagAll,
     TagKey,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-enum ColumnVisibilityHover {
-    Key(String),
-    ToggleAll,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,9 +551,6 @@ pub struct FileTable {
     selected: BTreeSet<PathBuf>,
     selection_anchor: Option<PathBuf>,
     selected_rows_actions_cache: Option<SelectedRowsActionsCache>,
-    hidden_tag_keys: BTreeSet<String>,
-    column_visibility_menu_position: Option<Point<Pixels>>,
-    hovered_column_visibility: Option<ColumnVisibilityHover>,
     row_scroll_handle: VirtualListScrollHandle,
     row_sizes: Rc<Vec<Size<Pixels>>>,
     tag_width_cache: Option<TagWidthCache>,
@@ -648,8 +644,6 @@ impl FileTable {
             let gap_width = if value_width > 0. { TAG_GAP_WIDTH } else { 0. };
             let action_width = if Self::editing_is_add(editing, &record.path, key) {
                 TAG_EDITOR_WIDTH
-            } else if record.is_convertible() {
-                0.
             } else {
                 TAG_ADD_BUTTON_WIDTH
             };
@@ -731,8 +725,6 @@ impl FileTable {
         )
         .detach();
 
-        let hidden_tag_keys = library.read(cx).hidden_tag_column_keys();
-
         Self {
             library,
             tag_input,
@@ -762,9 +754,6 @@ impl FileTable {
             selected: BTreeSet::new(),
             selection_anchor: None,
             selected_rows_actions_cache: None,
-            hidden_tag_keys,
-            column_visibility_menu_position: None,
-            hovered_column_visibility: None,
             row_scroll_handle: VirtualListScrollHandle::new(),
             row_sizes: Rc::new(Vec::new()),
             tag_width_cache: None,
@@ -826,10 +815,11 @@ impl FileTable {
             let library = self.library.read(cx);
             let revision = library.table_revision();
             let state = library.active_state();
+            let hidden_tag_keys = library.hidden_tag_column_keys();
             let keys: Vec<String> = state
                 .schema
                 .keys()
-                .filter(|key| !self.hidden_tag_keys.contains(*key))
+                .filter(|key| !hidden_tag_keys.contains(*key))
                 .cloned()
                 .collect();
             let row_count = state.results.len();
@@ -880,293 +870,59 @@ impl FileTable {
             .collect()
     }
 
-    fn persist_hidden_tag_columns(&self, cx: &mut Context<Self>) {
-        let hidden = self.hidden_tag_keys.clone();
-        self.library.update(cx, |lib, cx| {
-            lib.set_hidden_tag_column_keys(hidden, cx);
-        });
-    }
-
-    fn toggle_tag_column(&mut self, key: &str, cx: &mut Context<Self>) {
-        if !self.hidden_tag_keys.remove(key) {
-            self.hidden_tag_keys.insert(key.to_string());
-        }
-        self.tag_width_cache = None;
-        self.persist_hidden_tag_columns(cx);
-        cx.notify();
-    }
-
-    fn show_all_tag_columns(&mut self, cx: &mut Context<Self>) {
-        if !self.hidden_tag_keys.is_empty() {
-            self.hidden_tag_keys.clear();
-            self.tag_width_cache = None;
-            self.persist_hidden_tag_columns(cx);
-            cx.notify();
-        }
-    }
-
-    fn hide_all_tag_columns(&mut self, keys: &[String], cx: &mut Context<Self>) {
-        self.hidden_tag_keys = keys.iter().cloned().collect();
-        self.tag_width_cache = None;
-        self.persist_hidden_tag_columns(cx);
-        cx.notify();
-    }
-
-    fn open_column_visibility_menu(
-        &mut self,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.focus_handle.focus(window, cx);
-        self.column_visibility_menu_position = Some(position);
-        self.hovered_column_visibility = None;
-        cx.notify();
-    }
-
-    fn close_column_visibility_menu(&mut self, cx: &mut Context<Self>) -> bool {
-        let closed = self.column_visibility_menu_position.take().is_some()
-            || self.hovered_column_visibility.take().is_some();
-        if closed {
-            cx.notify();
-        }
-        closed
-    }
-
-    pub(crate) fn cancel_column_visibility_menu(&mut self, cx: &mut Context<Self>) -> bool {
-        self.close_column_visibility_menu(cx)
-    }
-
-    fn set_column_visibility_hovered(
-        &mut self,
-        target: ColumnVisibilityHover,
-        hovered: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if hovered {
-            if self.hovered_column_visibility.as_ref() != Some(&target) {
-                self.hovered_column_visibility = Some(target);
-                cx.notify();
-            }
-        } else if self.hovered_column_visibility.as_ref() == Some(&target) {
-            self.hovered_column_visibility = None;
-            cx.notify();
-        }
-    }
-
-    fn column_visibility_row(label: impl Into<SharedString>, checked: bool) -> gpui::Div {
-        div()
-            .h_flex()
-            .h(px(26.))
-            .w_full()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .rounded_md()
-            .text_sm()
-            .cursor_pointer()
-            .child(
-                div()
-                    .size_4()
-                    .h_flex()
-                    .items_center()
-                    .justify_center()
-                    .when(checked, |el| el.child(Icon::new(IconName::Check).small())),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .whitespace_nowrap()
-                    .child(label.into()),
-            )
-    }
-
-    fn column_visibility_action_row(label: impl Into<SharedString>) -> gpui::Div {
-        div()
-            .h_flex()
-            .h(px(26.))
-            .w_full()
-            .items_center()
-            .px_2()
-            .rounded_md()
-            .text_sm()
-            .cursor_pointer()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .whitespace_nowrap()
-                    .child(label.into()),
-            )
-    }
-
-    fn render_column_visibility_menu(
+    fn column_visibility_trigger(
         &self,
-        keys: Vec<String>,
-        window: &mut Window,
+        id: impl Into<SharedString>,
+        keys: &[String],
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let position = self.column_visibility_menu_position?;
-        let window_size = window.bounds().size;
-        let all_visible = keys
-            .iter()
-            .all(|key| !self.hidden_tag_keys.contains(key.as_str()));
-        let toggle_label = if all_visible { "Hide All" } else { "Show All" };
-
-        let mut rows = div().v_flex().gap_y_0p5();
-        if keys.is_empty() {
-            rows = rows.child(
-                div()
-                    .h_flex()
-                    .h(px(26.))
-                    .w_full()
-                    .items_center()
-                    .px_2()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("No tag columns"),
-            );
-        } else {
-            rows = rows.child(
-                div()
-                    .h_flex()
-                    .h(px(26.))
-                    .w_full()
-                    .items_center()
-                    .px_2()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Tag Columns"),
-            );
-
-            for key in &keys {
-                let checked = !self.hidden_tag_keys.contains(key.as_str());
-                let item_key = key.clone();
-                let hover_target = ColumnVisibilityHover::Key(key.clone());
-                let row_hovered = self.hovered_column_visibility.as_ref() == Some(&hover_target);
-                rows = rows.child(
-                    Self::column_visibility_row(SharedString::from(key.clone()), checked)
-                        .id(SharedString::from(format!("column-visibility-row:{key}")))
-                        .when(row_hovered, |el| {
-                            el.bg(cx.theme().accent)
-                                .text_color(cx.theme().accent_foreground)
-                        })
-                        .on_hover(cx.listener({
-                            let hover_target = hover_target.clone();
-                            move |this, hovered: &bool, _, cx| {
-                                this.set_column_visibility_hovered(
-                                    hover_target.clone(),
-                                    *hovered,
-                                    cx,
-                                );
+    ) -> impl IntoElement {
+        let library = self.library.clone();
+        let hidden = library.read(cx).hidden_tag_column_keys();
+        let menu_keys = keys.to_vec();
+        let all_visible = menu_keys.iter().all(|key| !hidden.contains(key));
+        div()
+            .id(id.into())
+            .h_full()
+            .flex_1()
+            .min_w_0()
+            .context_menu(move |mut menu, _, _| {
+                for key in &menu_keys {
+                    let library = library.clone();
+                    let key = key.clone();
+                    let checked = !hidden.contains(&key);
+                    menu = menu.item(PopupMenuItem::new(key.clone()).checked(checked).on_click(
+                        move |_, _, cx| {
+                            let mut hidden = library.read(cx).hidden_tag_column_keys();
+                            if !hidden.remove(&key) {
+                                hidden.insert(key.clone());
                             }
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                window.prevent_default();
-                                this.toggle_tag_column(&item_key, cx);
-                                window.refresh();
-                                cx.stop_propagation();
-                            }),
-                        )
-                        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
-                );
-            }
-
-            let toggle_hovered =
-                self.hovered_column_visibility.as_ref() == Some(&ColumnVisibilityHover::ToggleAll);
-
-            rows = rows
-                .child(
-                    div()
-                        .h_auto()
-                        .p_0()
-                        .my_0p5()
-                        .mx_neg_1()
-                        .border_b(px(2.))
-                        .border_color(cx.theme().border),
-                )
-                .child(
-                    Self::column_visibility_action_row(toggle_label)
-                        .id("column-visibility-toggle-all")
-                        .when(toggle_hovered, |el| {
-                            el.bg(cx.theme().accent)
-                                .text_color(cx.theme().accent_foreground)
-                        })
-                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                            this.set_column_visibility_hovered(
-                                ColumnVisibilityHover::ToggleAll,
-                                *hovered,
-                                cx,
-                            );
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener({
-                                let keys = keys.clone();
-                                move |this, _, window, cx| {
-                                    window.prevent_default();
+                            library.update(cx, |lib, cx| {
+                                lib.set_hidden_tag_column_keys(hidden, cx);
+                            });
+                        },
+                    ));
+                }
+                if !menu_keys.is_empty() {
+                    let library = library.clone();
+                    let keys = menu_keys.clone();
+                    menu = menu.separator().item(
+                        PopupMenuItem::new(if all_visible { "Hide All" } else { "Show All" })
+                            .on_click(move |_, _, cx| {
+                                library.update(cx, |lib, cx| {
                                     if all_visible {
-                                        this.hide_all_tag_columns(&keys, cx);
+                                        lib.set_hidden_tag_column_keys(
+                                            keys.iter().cloned().collect(),
+                                            cx,
+                                        );
                                     } else {
-                                        this.show_all_tag_columns(cx);
+                                        lib.set_hidden_tag_column_keys(BTreeSet::new(), cx);
                                     }
-                                    window.refresh();
-                                    cx.stop_propagation();
-                                }
+                                });
                             }),
-                        )
-                        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
-                );
-        }
-
-        Some(
-            deferred(
-                anchored().child(
-                    div()
-                        .w(window_size.width)
-                        .h(window_size.height)
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.close_column_visibility_menu(cx);
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, _, _, cx| {
-                                this.close_column_visibility_menu(cx);
-                            }),
-                        )
-                        .child(
-                            anchored()
-                                .position(position)
-                                .snap_to_window_with_margin(px(8.))
-                                .anchor(Anchor::TopLeft)
-                                .child(
-                                    div()
-                                        .id("column-visibility-menu")
-                                        .popover_style(cx)
-                                        .min_w(px(140.))
-                                        .max_w(px(260.))
-                                        .p_1()
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .child(rows),
-                                ),
-                        ),
-                ),
-            )
-            .with_priority(1)
-            .into_any_element(),
-        )
+                    );
+                }
+                menu
+            })
     }
 
     fn row_sizes(&mut self, len: usize) -> Rc<Vec<Size<Pixels>>> {
@@ -1249,9 +1005,7 @@ impl FileTable {
             .active_state()
             .all_records
             .iter()
-            .find(|record| {
-                record.path == path || record.variants.iter().any(|variant| variant.path == path)
-            })
+            .find(|record| record.contains_path(&path))
             .and_then(FileRecord::effective_row_trim)
             .map_or(0., |trim| trim.start_ratio);
         self.library.update(cx, |lib, cx| {
@@ -1646,19 +1400,7 @@ impl FileTable {
     }
 
     fn selected_priority_paths(&self, records: &[FileRecord], path: &Path) -> Vec<PathBuf> {
-        if self.selected.len() > 1 && self.selected.contains(path) {
-            records
-                .iter()
-                .filter(|record| self.selected.contains(record.path.as_path()))
-                .map(|record| record.path.clone())
-                .collect()
-        } else {
-            records
-                .iter()
-                .find(|record| record.path.as_path() == path)
-                .map(|record| vec![record.path.clone()])
-                .unwrap_or_default()
-        }
+        primary_paths(records_for_path(records, &self.selected, path))
     }
 
     fn selected_paths_for_extension(
@@ -1667,33 +1409,13 @@ impl FileTable {
         path: &Path,
         extension: &str,
     ) -> Vec<PathBuf> {
-        if self.selected.len() > 1 && self.selected.contains(path) {
-            records
-                .iter()
-                .filter(|record| self.selected.contains(record.path.as_path()))
-                .filter_map(|record| record.variant_for_extension(extension))
-                .map(|variant| variant.path.clone())
-                .collect()
-        } else {
-            records
-                .iter()
-                .find(|record| record.path.as_path() == path)
-                .and_then(|record| record.variant_for_extension(extension))
-                .map(|variant| vec![variant.path.clone()])
-                .unwrap_or_default()
-        }
+        extension_paths(records_for_path(records, &self.selected, path), extension)
     }
 
     fn selected_tag_paths(&self, records: &[FileRecord], path: &Path) -> Vec<PathBuf> {
-        if self.selected.len() > 1 && self.selected.contains(path) {
-            let paths: Vec<PathBuf> = records
-                .iter()
-                .filter(|record| self.selected.contains(record.path.as_path()))
-                .map(|record| record.path.clone())
-                .collect();
-            if !paths.is_empty() {
-                return paths;
-            }
+        let paths = primary_paths(records_for_path(records, &self.selected, path));
+        if !paths.is_empty() {
+            return paths;
         }
 
         vec![path.to_path_buf()]
@@ -1713,13 +1435,7 @@ impl FileTable {
     }
 
     fn record_delete_target(record: &FileRecord) -> Arc<DeleteTarget> {
-        let mut seen = BTreeSet::new();
-        let paths = record
-            .variants
-            .iter()
-            .map(|variant| variant.path.clone())
-            .filter(|path| seen.insert(path.clone()))
-            .collect();
+        let paths = variant_paths(std::iter::once(record));
 
         Arc::new(DeleteTarget {
             kind: DeleteKind::Rows,
@@ -1737,25 +1453,15 @@ impl FileTable {
     }
 
     fn favorite_target(records: &[&FileRecord]) -> FavoriteTarget {
-        let mut seen = BTreeSet::new();
         FavoriteTarget {
-            paths: records
-                .iter()
-                .flat_map(|record| record.variants.iter().map(|variant| variant.path.clone()))
-                .filter(|path| seen.insert(path.clone()))
-                .collect(),
+            paths: variant_paths(records.iter().copied()),
             all_favorite: !records.is_empty() && records.iter().all(|record| record.favorite),
         }
     }
 
     fn selected_rows_actions(records: &[&FileRecord]) -> Arc<SelectedRowsActions> {
         let row_drag_paths = Arc::new(records.iter().map(|record| record.path.clone()).collect());
-        let mut seen = BTreeSet::new();
-        let delete_paths = records
-            .iter()
-            .flat_map(|record| record.variants.iter().map(|variant| variant.path.clone()))
-            .filter(|path| seen.insert(path.clone()))
-            .collect();
+        let delete_paths = variant_paths(records.iter().copied());
         let delete_target = Arc::new(DeleteTarget {
             kind: DeleteKind::Rows,
             row_count: records.len(),
@@ -1832,22 +1538,19 @@ impl FileTable {
         let table_revision = self.library.read(cx).table_revision();
         if let Some(cache) = self.selected_rows_actions_cache.as_ref()
             && cache.table_revision == table_revision
+            && cache.selection == self.selected
         {
             return Some(cache.actions.clone());
         }
 
         let actions = {
             let library = self.library.read(cx);
-            let selected_records: Vec<_> = library
-                .active_state()
-                .results
-                .iter()
-                .filter(|record| self.selected.contains(record.path.as_path()))
-                .collect();
-            Self::selected_rows_actions(&selected_records)
+            let rows = selected_records(&library.active_state().results, &self.selected);
+            Self::selected_rows_actions(&rows)
         };
         self.selected_rows_actions_cache = Some(SelectedRowsActionsCache {
             table_revision,
+            selection: self.selected.clone(),
             actions: actions.clone(),
         });
         Some(actions)
@@ -1882,23 +1585,13 @@ impl FileTable {
         }
 
         let state = self.library.read(cx);
-        let selected_records: Vec<&FileRecord> = state
-            .active_state()
-            .results
-            .iter()
-            .filter(|record| self.selected.contains(record.path.as_path()))
-            .collect();
+        let selected_records = selected_records(&state.active_state().results, &self.selected);
 
         if selected_records.is_empty() {
             return None;
         }
 
-        let mut seen = BTreeSet::new();
-        let paths = selected_records
-            .iter()
-            .flat_map(|record| record.variants.iter().map(|variant| variant.path.clone()))
-            .filter(|path| seen.insert(path.clone()))
-            .collect();
+        let paths = variant_paths(selected_records.iter().copied());
 
         Some(DeleteTarget {
             kind: DeleteKind::Rows,
@@ -1913,13 +1606,11 @@ impl FileTable {
         }
 
         let state = self.library.read(cx);
-        let records: Vec<RowRenameTarget> = state
-            .active_state()
-            .results
-            .iter()
-            .filter(|record| self.selected.contains(record.path.as_path()))
-            .map(row_rename_target)
-            .collect();
+        let records: Vec<RowRenameTarget> =
+            selected_records(&state.active_state().results, &self.selected)
+                .into_iter()
+                .map(row_rename_target)
+                .collect();
 
         (!records.is_empty()).then_some(RenameTarget {
             kind: RenameKind::Rows { records },
@@ -2187,12 +1878,7 @@ impl FileTable {
     pub fn toggle_selected_favorites(&mut self, cx: &mut Context<Self>) -> bool {
         let target = {
             let library = self.library.read(cx);
-            let records: Vec<_> = library
-                .active_state()
-                .results
-                .iter()
-                .filter(|record| self.selected.contains(record.path.as_path()))
-                .collect();
+            let records = selected_records(&library.active_state().results, &self.selected);
             Self::favorite_target(&records)
         };
         if target.paths.is_empty() {

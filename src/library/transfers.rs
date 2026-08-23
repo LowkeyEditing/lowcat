@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -10,9 +9,11 @@ use crate::downloader::{
     self, DownloadCancel, DownloadError, DownloadErrorKind, DownloadProgressEvent, DownloadRequest,
     DownloadState, DownloadStatus,
 };
-use crate::model::{AudioFormat, Category};
+use crate::model::{AudioFormat, Category, unique_paths};
 
-use super::{ImportProgress, Library, database_path_for_settings, debug_downloader_interaction};
+use super::{
+    ImportProgress, Library, OpenPanel, database_path_for_settings, debug_downloader_interaction,
+};
 
 pub(super) struct ImportBatchResult {
     category: Category,
@@ -46,7 +47,7 @@ enum ImportProgressEvent {
 
 impl Library {
     pub fn downloader_open(&self) -> bool {
-        self.downloader_open
+        matches!(self.open_panel, Some(OpenPanel::Downloader))
     }
 
     pub fn download_state(&self) -> DownloadState {
@@ -63,9 +64,8 @@ impl Library {
         clipboard_text: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.downloader_open = true;
-        let filters_were_open = self.filters_open;
-        self.filters_open = false;
+        let filters_were_open = self.filters_open();
+        self.open_panel = Some(OpenPanel::Downloader);
         if filters_were_open {
             self.clear_import_priority();
             self.refresh_search_results(self.active);
@@ -117,7 +117,7 @@ impl Library {
         let request = DownloadRequest {
             url,
             folder,
-            format: self.download_format,
+            format: self.download_format(),
         };
         let cancel = DownloadCancel::default();
         self.download_cancel = Some(cancel.clone());
@@ -273,11 +273,7 @@ impl Library {
             return;
         }
 
-        let mut seen = BTreeSet::new();
-        let sources: Vec<PathBuf> = sources
-            .into_iter()
-            .filter(|source| seen.insert(source.clone()))
-            .collect();
+        let sources = unique_paths(sources);
         if sources.is_empty() {
             cx.notify();
             return;
@@ -285,7 +281,7 @@ impl Library {
 
         let category = self.active;
         let behavior = self.convert_conflict_behavior;
-        let db_path = database_path_for_settings(&self.settings_path);
+        let db_path = database_path_for_settings(self.settings.path());
         self.importing = true;
         self.import_progress = Some(ImportProgress {
             file_name: file_name(&sources[0]),
@@ -357,11 +353,7 @@ impl Library {
     }
 
     pub fn trash_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let mut seen = BTreeSet::new();
-        let paths: Vec<PathBuf> = paths
-            .into_iter()
-            .filter(|path| seen.insert(path.clone()))
-            .collect();
+        let paths = unique_paths(paths);
         if paths.is_empty() {
             cx.notify();
             return;
@@ -536,13 +528,13 @@ impl Library {
                     record
                         .variants
                         .iter()
-                        .any(|variant| destinations.iter().any(|path| *path == &variant.path))
+                        .any(|variant| destinations.contains(&&variant.path))
                 });
                 let visible = state.results.iter().any(|record| {
                     record
                         .variants
                         .iter()
-                        .any(|variant| destinations.iter().any(|path| *path == &variant.path))
+                        .any(|variant| destinations.contains(&&variant.path))
                 });
                 format!(
                     "refreshed category={} indexed={} visible={} all_records={} results={} search={:?} selected={:?}",

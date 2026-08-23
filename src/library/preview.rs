@@ -81,7 +81,7 @@ impl Library {
             return;
         }
         self.waveform_cache_in_flight = true;
-        let db_path = database_path_for_settings(&self.settings_path);
+        let db_path = database_path_for_settings(self.settings.path());
         let skipped_paths = self.waveform_cache_skipped_paths.clone();
         let fetch_limit = BATCH_SIZE + skipped_paths.len();
         let task = cx.background_spawn(async move {
@@ -139,7 +139,7 @@ impl Library {
 
         self.waveform_cache_skipped_paths.remove(&path);
         self.waveform_priority_cache_in_flight.insert(path.clone());
-        let db_path = database_path_for_settings(&self.settings_path);
+        let db_path = database_path_for_settings(self.settings.path());
         let task = cx.background_spawn(async move {
             let backend = Backend::new(db_path)?;
             let result = crate::preview_waveform::generate_waveform_binary256(&path)
@@ -242,7 +242,7 @@ impl Library {
 
     fn ensure_preview_player(&mut self) {
         if self.preview_player.is_none() {
-            self.preview_player = Some(PreviewPlayer::new(self.preview_volume));
+            self.preview_player = Some(PreviewPlayer::new(self.preview_volume()));
         }
     }
 

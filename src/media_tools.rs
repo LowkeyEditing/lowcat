@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -20,6 +20,70 @@ pub enum SearchLocation {
 
 pub fn command(tool: &str) -> Command {
     Command::new(resolve(tool).unwrap_or_else(|| PathBuf::from(tool)))
+}
+
+pub(crate) fn probe_duration_seconds(path: &Path) -> Option<f64> {
+    let output = command("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let duration = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    (duration.is_finite() && duration > 0.).then_some(duration)
+}
+
+pub(crate) fn probe_audio_channels(path: &Path) -> io::Result<usize> {
+    let output = command("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=channels",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("ffprobe channel probe failed"));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn has_audio_stream(path: &Path) -> bool {
+    command("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .map(|output| output.status.success() && !output.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 pub fn available(tool: &str) -> bool {

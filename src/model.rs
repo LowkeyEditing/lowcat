@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -130,22 +130,19 @@ pub struct FolderTagAssignment {
 pub struct FileRecord {
     pub name: String,
     pub path: PathBuf,
-    pub support: FileSupport,
     pub stem: String,
     pub variants: Vec<FileVariant>,
     pub tags: BTreeMap<String, Vec<String>>,
     pub favorite: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileSupport {
-    Native,
-    Convertible,
-}
-
 impl FileRecord {
-    pub fn is_convertible(&self) -> bool {
-        self.support == FileSupport::Convertible
+    pub fn contains_path(&self, path: &Path) -> bool {
+        self.path == path || self.variants.iter().any(|variant| variant.path == path)
+    }
+
+    pub fn variant_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.variants.iter().map(|variant| &variant.path)
     }
 
     pub fn variant_for_extension(&self, extension: &str) -> Option<&FileVariant> {
@@ -295,12 +292,15 @@ impl FromStr for ConvertConflictBehavior {
 }
 
 pub fn default_format_priority() -> Vec<AudioFormat> {
-    vec![
-        AudioFormat::Mp3,
-        AudioFormat::Wav,
-        AudioFormat::Opus,
-        AudioFormat::Flac,
-    ]
+    AudioFormat::ALL.to_vec()
+}
+
+pub(crate) fn unique_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
 }
 
 pub fn normalize_format_priority(priority: Vec<AudioFormat>) -> Vec<AudioFormat> {
@@ -582,7 +582,6 @@ mod tests {
         FileRecord {
             name: name.to_string(),
             path: PathBuf::from(name),
-            support: FileSupport::Native,
             stem: name
                 .rsplit_once('.')
                 .map(|(stem, _)| stem)

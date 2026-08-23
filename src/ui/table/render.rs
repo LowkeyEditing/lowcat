@@ -8,6 +8,33 @@ struct RowRenderLayout<'a> {
 }
 
 impl FileTable {
+    fn render_tag_editor(&self, width: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h_flex()
+            .items_center()
+            .w(width)
+            .flex_shrink_0()
+            .px_1p5()
+            .rounded_md()
+            .text_xs()
+            .bg(cx.theme().muted)
+            .overflow_hidden()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.cancel_tag(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                Input::new(&self.tag_input)
+                    .appearance(false)
+                    .xsmall()
+                    .px_0()
+                    .flex_1()
+                    .mr(px(-10.)),
+            )
+    }
+
     fn render_rows(
         &mut self,
         range: Range<usize>,
@@ -73,7 +100,6 @@ impl FileTable {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let path = record.path.clone();
-        let convertible = record.is_convertible();
         let recently_imported = self.library.read(cx).record_is_recently_imported(record);
         let favorite_highlighted =
             favorite_row_highlighted(record.favorite, self.library.read(cx).favorites_only());
@@ -107,12 +133,7 @@ impl FileTable {
         let rename_target = multi_selection
             .map(|actions| actions.rename_target.clone())
             .unwrap_or_else(|| Self::record_rename_target(record));
-        let row_hover_bg = if convertible {
-            hsla(0.095, 1., 0.55, 0.2)
-        } else {
-            cx.theme().table_hover
-        };
-        let convertible_bg = hsla(0.095, 1., 0.55, 0.12);
+        let row_hover_bg = cx.theme().table_hover;
         let recently_imported_bg = cx.theme().success.opacity(0.14);
         let favorite_bg = cx.theme().warning.opacity(0.14);
         let chip_delete_bg = red().opacity(0.18);
@@ -152,7 +173,6 @@ impl FileTable {
             .when(row_ix > 0, |s| {
                 s.border_t_1().border_color(cx.theme().table_row_border)
             })
-            .when(convertible, |s| s.bg(convertible_bg))
             .when(favorite_highlighted, |s| s.bg(favorite_bg))
             .when(recently_imported, |s| s.bg(recently_imported_bg))
             .when(selected || row_hovered, |s| s.bg(row_hover_bg))
@@ -588,36 +608,7 @@ impl FileTable {
                         .items_center();
 
                     if is_renaming {
-                        chip = chip.child(
-                            div()
-                                .w(chip_width)
-                                .min_w(chip_width)
-                                .h_flex()
-                                .items_center()
-                                .flex_shrink_0()
-                                .px_1p5()
-                                .rounded_md()
-                                .text_xs()
-                                .bg(cx.theme().muted)
-                                .overflow_hidden()
-                                .on_key_down(cx.listener(
-                                    |this, event: &KeyDownEvent, window, cx| {
-                                        if event.keystroke.key == "escape" {
-                                            this.cancel_tag(window, cx);
-                                            cx.stop_propagation();
-                                        }
-                                    },
-                                ))
-                                .child(
-                                    Input::new(&self.tag_input)
-                                        .appearance(false)
-                                        .xsmall()
-                                        .px_0()
-                                        .flex_1()
-                                        .mr(px(-10.))
-                                        .min_w_0(),
-                                ),
-                        );
+                        chip = chip.child(self.render_tag_editor(chip_width, cx));
                     } else {
                         let rename_target = tag_target.clone();
                         chip = chip
@@ -701,34 +692,8 @@ impl FileTable {
             if preview_active {
                 cell = cell.child(div());
             } else if Self::editing_is_add(self.editing.as_ref(), &path, key) {
-                cell = cell.child(
-                    div()
-                        .h_flex()
-                        .items_center()
-                        .w(px(TAG_EDITOR_WIDTH))
-                        .flex_shrink_0()
-                        .px_1p5()
-                        .rounded_md()
-                        .text_xs()
-                        .bg(cx.theme().muted)
-                        .overflow_hidden()
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                            if event.keystroke.key == "escape" {
-                                this.cancel_tag(window, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .child(
-                            Input::new(&self.tag_input)
-                                .appearance(false)
-                                .xsmall()
-                                .px_0()
-                                .flex_1()
-                                .mr(px(-10.))
-                                .min_w_0(),
-                        ),
-                );
-            } else if !convertible {
+                cell = cell.child(self.render_tag_editor(px(TAG_EDITOR_WIDTH), cx));
+            } else {
                 let (key, path) = (key.clone(), path.clone());
                 cell = cell.child(
                     div()
@@ -836,12 +801,10 @@ impl Render for FileTable {
                                 )
                             }),
                     )
-                    .child(div().h_full().flex_1().min_w_0().on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            this.open_column_visibility_menu(event.position, window, cx);
-                            cx.stop_propagation();
-                        }),
+                    .child(self.column_visibility_trigger(
+                        "name-column-visibility-trigger",
+                        &tag_column_keys,
+                        cx,
                     )),
             ),
         );
@@ -950,12 +913,10 @@ impl Render for FileTable {
                                 }),
                             )
                             .child(header_label)
-                            .child(div().h_full().flex_1().min_w_0().on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                    this.open_column_visibility_menu(event.position, window, cx);
-                                    cx.stop_propagation();
-                                }),
+                            .child(self.column_visibility_trigger(
+                                SharedString::from(format!("column-visibility-trigger:{key}")),
+                                &tag_column_keys,
+                                cx,
                             )),
                     ),
             );
@@ -1013,12 +974,10 @@ impl Render for FileTable {
                         .h_flex()
                         .items_center()
                         .child(tag_key_action)
-                        .child(div().h_full().flex_1().min_w_0().on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                this.open_column_visibility_menu(event.position, window, cx);
-                                cx.stop_propagation();
-                            }),
+                        .child(self.column_visibility_trigger(
+                            "action-column-visibility-trigger",
+                            &tag_column_keys,
+                            cx,
                         )),
                 ),
         );
@@ -1074,8 +1033,6 @@ impl Render for FileTable {
                 .scrollbar(&row_scroll_handle, ScrollbarAxis::Vertical)
                 .into_any_element()
         };
-        let column_visibility_menu =
-            self.render_column_visibility_menu(tag_column_keys, window, cx);
         let table_for_window_boundary = cx.entity();
         let native_drag_on_window_boundary = canvas(
             |_, _, _| (),
@@ -1112,7 +1069,6 @@ impl Render for FileTable {
                 match event.keystroke.key.as_str() {
                     "escape"
                         if this.cancel_file_drag(window, cx)
-                            || this.close_column_visibility_menu(cx)
                             || this.cancel_delete(cx)
                             || this.clear_selection(cx) =>
                     {
@@ -1152,8 +1108,7 @@ impl Render for FileTable {
                     .min_h_0()
                     .child(div().size_full().child(rows)),
             )
-            .child(native_drag_on_window_boundary)
-            .when_some(column_visibility_menu, |table, menu| table.child(menu));
+            .child(native_drag_on_window_boundary);
 
         crate::perf::finish("table.render", render_start, || {
             format!(

@@ -4,6 +4,7 @@ mod backend;
 mod db;
 mod diagnostics;
 mod downloader;
+mod fs_utils;
 mod library;
 #[cfg(target_os = "macos")]
 mod macos_url_drop;
@@ -13,6 +14,8 @@ mod opus_source;
 mod perf;
 mod preview_player;
 mod preview_waveform;
+#[cfg(test)]
+mod test_support;
 mod ui;
 
 use std::borrow::Cow;
