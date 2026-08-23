@@ -1,9 +1,16 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source, cpal};
+use rodio::{
+    Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source, cpal,
+    cpal::traits::{DeviceTrait as _, HostTrait as _},
+};
 
 use crate::opus_source::OpusSource;
 
@@ -18,6 +25,8 @@ pub struct PreviewPlayer {
     active: Option<ActivePlayback>,
     current_path: Option<PathBuf>,
     current_duration: Option<Duration>,
+    output_device_id: Option<cpal::DeviceId>,
+    output_failed: Arc<AtomicBool>,
     volume: f32,
 }
 
@@ -33,6 +42,8 @@ impl PreviewPlayer {
             active: None,
             current_path: None,
             current_duration: None,
+            output_device_id: None,
+            output_failed: Arc::new(AtomicBool::new(false)),
             volume: volume.clamp(0., 1.),
         }
     }
@@ -62,7 +73,12 @@ impl PreviewPlayer {
         }
     }
 
-    fn play_source<S>(&mut self, path: PathBuf, start: PreviewStart, source: S) -> io::Result<()>
+    fn play_source<S>(
+        &mut self,
+        path: PathBuf,
+        start: PreviewStart,
+        mut source: S,
+    ) -> io::Result<()>
     where
         S: Source + Send + 'static,
     {
@@ -77,13 +93,12 @@ impl PreviewPlayer {
             }
         };
 
+        if !offset.is_zero() {
+            source.try_seek(offset).map_err(io::Error::other)?;
+        }
         let player = Player::connect_new(self.ensure_output()?.mixer());
         player.set_volume(self.volume);
-        player.pause();
         player.append(source);
-        if !offset.is_zero() {
-            player.try_seek(offset).map_err(io::Error::other)?;
-        }
         player.play();
 
         self.active = Some(ActivePlayback {
@@ -103,14 +118,29 @@ impl PreviewPlayer {
     }
 
     fn ensure_output(&mut self) -> io::Result<&MixerDeviceSink> {
+        let device = cpal::default_host()
+            .default_output_device()
+            .ok_or_else(|| io::Error::other("audio output unavailable"))?;
+        let device_id = device.id().map_err(io::Error::other)?;
+        if self.output_failed.swap(false, Ordering::AcqRel)
+            || self.output_device_id.as_ref() != Some(&device_id)
+        {
+            self.output = None;
+        }
         if self.output.is_none() {
-            let mut output = DeviceSinkBuilder::from_default_device()
+            let output_failed = Arc::clone(&self.output_failed);
+            let mut output = DeviceSinkBuilder::from_device(device)
                 .map_err(io::Error::other)?
                 .with_buffer_size(cpal::BufferSize::Fixed(256))
+                .with_error_callback(move |error| {
+                    eprintln!("lowcat audio output failed error={error}");
+                    output_failed.store(true, Ordering::Release);
+                })
                 .open_sink_or_fallback()
                 .map_err(io::Error::other)?;
             output.log_on_drop(false);
             self.output = Some(output);
+            self.output_device_id = Some(device_id);
         }
         self.output
             .as_ref()
@@ -188,7 +218,7 @@ fn is_opus(path: &Path) -> bool {
 }
 
 fn audible_position(raw: Duration, started_offset: Duration, output_delay: Duration) -> Duration {
-    raw.saturating_sub(output_delay).max(started_offset)
+    started_offset.saturating_add(raw.saturating_sub(output_delay))
 }
 
 pub fn offset_for_ratio(duration: Duration, ratio: f32) -> Duration {
@@ -219,9 +249,9 @@ mod tests {
     fn audible_position_waits_for_queued_audio() {
         let start = Duration::from_secs(30);
         let delay = Duration::from_millis(12);
-        assert_eq!(audible_position(start, start, delay), start);
+        assert_eq!(audible_position(Duration::ZERO, start, delay), start);
         assert_eq!(
-            audible_position(start + Duration::from_millis(20), start, delay),
+            audible_position(Duration::from_millis(20), start, delay),
             start + Duration::from_millis(8)
         );
     }
