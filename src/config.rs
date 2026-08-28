@@ -242,34 +242,33 @@ mod tests {
 
     #[test]
     fn windows_prefers_appdata() {
+        let app_data = PathBuf::from(r"C:\Users\tester\AppData\Roaming");
         let path = settings_path_from_values(
             Some(PathBuf::from(r"C:\xdg")),
             Some(PathBuf::from(r"C:\Users\tester")),
-            Some(PathBuf::from(r"C:\Users\tester\AppData\Roaming")),
+            Some(app_data.clone()),
             true,
         );
 
-        assert_eq!(
-            path,
-            PathBuf::from(r"C:\Users\tester\AppData\Roaming\lowcat\settings.toml")
-        );
+        assert_eq!(path, app_data.join("lowcat").join("settings.toml"));
     }
 
     #[test]
     fn windows_falls_back_to_xdg_then_home() {
+        let xdg = PathBuf::from(r"C:\xdg");
         let xdg_path = settings_path_from_values(
-            Some(PathBuf::from(r"C:\xdg")),
+            Some(xdg.clone()),
             Some(PathBuf::from(r"C:\Users\tester")),
             None,
             true,
         );
-        assert_eq!(xdg_path, PathBuf::from(r"C:\xdg\lowcat\settings.toml"));
+        assert_eq!(xdg_path, xdg.join("lowcat").join("settings.toml"));
 
-        let home_path =
-            settings_path_from_values(None, Some(PathBuf::from(r"C:\Users\tester")), None, true);
+        let home = PathBuf::from(r"C:\Users\tester");
+        let home_path = settings_path_from_values(None, Some(home.clone()), None, true);
         assert_eq!(
             home_path,
-            PathBuf::from(r"C:\Users\tester\.config\lowcat\settings.toml")
+            home.join(".config").join("lowcat").join("settings.toml")
         );
     }
 
