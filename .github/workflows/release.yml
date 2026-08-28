@@ -36,11 +36,58 @@ jobs:
       - name: Build package
         run: cargo-packager --release --formats dmg
 
-      # Create a draft GitHub Release for the tag, generate notes from commits/PRs,
-      # and attach the generated DMG file.
-      - name: Upload release artifact
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-package
+          path: target/release/*.dmg
+
+  build-windows:
+    name: Build Windows binary
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - run: choco install ffmpeg -y
+      - run: py -m pip install yt-dlp
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-packager
+        shell: pwsh
+        run: |
+          if (-not (Get-Command cargo-packager -ErrorAction SilentlyContinue)) {
+            cargo install cargo-packager --locked
+          }
+
+
+      # This uses the metadata already configured in Cargo.toml.
+      # Building step is already included in Cargo.toml's metadata section
+      - name: Build package
+        run: cargo-packager --release --formats wix
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: target/release/*.msi
+
+  release:
+    name: Create draft release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload release artifacts
         uses: softprops/action-gh-release@v3
         with:
           draft: true
           generate_release_notes: true
-          files: target/release/*.dmg
+          files: release-assets/*
+
