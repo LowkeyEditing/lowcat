@@ -3,18 +3,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use gpui::{
-    ExternalPaths, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, rgba,
-};
-use gpui_component::{ActiveTheme as _, StyledExt as _};
-
-use super::{UI, titlebar::TITLEBAR_LEFT_OFFSET};
+use super::UI;
 use crate::model::Category;
 
 const DROPPED_LINK_MAX_BYTES: u64 = 64 * 1024;
 
 impl UI {
-    fn download_dropped_link(
+    pub(super) fn download_dropped_link(
         &mut self,
         category: Category,
         paths: &[PathBuf],
@@ -28,68 +23,6 @@ impl UI {
             lib.download_from_clipboard(category, Some(link_text), cx);
         });
         true
-    }
-
-    /// Full-window overlay that fades in while OS files are dragged over the
-    /// window, aligned with the titlebar categories.
-    pub(super) fn render_drop_overlay(
-        &self,
-        cx: &mut gpui::Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let base_bg = rgba(0x70707066);
-        let highlight_bg = rgba(0x9a9a9aa6);
-        let mut columns = gpui::div().h_flex().size_full().pl(TITLEBAR_LEFT_OFFSET);
-        for category in Category::ALL {
-            let column = gpui::div()
-                .id(SharedString::from(format!(
-                    "drop-overlay:{}",
-                    category.label()
-                )))
-                .h_flex()
-                .flex_1()
-                .h_full()
-                .items_center()
-                .justify_center()
-                .border_l_1()
-                .border_color(rgba(0xffffff22))
-                .bg(base_bg)
-                .text_color(cx.theme().foreground)
-                .child(SharedString::from(category.label()))
-                .drag_over::<ExternalPaths>(move |style, paths, _, _| {
-                    if paths.paths().is_empty() {
-                        style
-                    } else {
-                        style.bg(highlight_bg)
-                    }
-                });
-
-            columns = columns.child(column.on_drop(cx.listener(
-                move |this, paths: &ExternalPaths, _, cx| {
-                    let paths = paths.paths().to_vec();
-                    crate::diagnostics::debug("drop-overlay", || {
-                        format!("category={} paths={paths:?}", category.label())
-                    });
-                    if !this.download_dropped_link(category, &paths, cx) {
-                        this.library
-                            .update(cx, |lib, cx| lib.import_files(category, paths, cx));
-                    }
-                },
-            )));
-        }
-
-        gpui::div()
-            .id("drop-overlay")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .opacity(0.)
-            // `drag_over` alone does not register a hitbox. An empty `hover`
-            // keeps the overlay detectable without changing layout.
-            .hover(|style| style)
-            .drag_over::<ExternalPaths>(|style, _, _, _| style.opacity(1.))
-            .on_drop(cx.listener(|_, _: &ExternalPaths, _, _| {}))
-            .child(columns)
     }
 }
 
@@ -114,7 +47,7 @@ fn dropped_download_link_text(paths: &[PathBuf]) -> Option<String> {
     extract_dropped_youtube_url(&text)
 }
 
-fn extract_dropped_youtube_url(text: &str) -> Option<String> {
+pub(crate) fn extract_dropped_youtube_url(text: &str) -> Option<String> {
     if let Ok(url) = crate::downloader::extract_youtube_url(text) {
         return Some(url);
     }

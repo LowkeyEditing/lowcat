@@ -189,11 +189,35 @@ struct CategoryFolders {
 }
 
 pub fn settings_path() -> PathBuf {
-    if let Some(config_home) = non_empty_env_path("XDG_CONFIG_HOME") {
+    settings_path_from_values(
+        non_empty_env_path("XDG_CONFIG_HOME"),
+        non_empty_env_path("HOME"),
+        non_empty_env_path("APPDATA"),
+        cfg!(target_os = "windows"),
+    )
+}
+
+fn settings_path_from_values(
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+    is_windows: bool,
+) -> PathBuf {
+    // Windows applications conventionally keep per-user configuration under
+    // %APPDATA%. Keep XDG_CONFIG_HOME as a fallback for explicitly configured
+    // environments (for example, MSYS2), and retain the previous Unix-style
+    // fallbacks when APPDATA is unavailable.
+    if is_windows {
+        if let Some(app_data) = app_data {
+            return app_data.join("lowcat").join("settings.toml");
+        }
+    }
+
+    if let Some(config_home) = xdg_config_home {
         return config_home.join("lowcat").join("settings.toml");
     }
 
-    if let Some(home) = non_empty_env_path("HOME") {
+    if let Some(home) = home {
         return home.join(".config").join("lowcat").join("settings.toml");
     }
 
@@ -208,5 +232,64 @@ fn non_empty_env_path(key: &str) -> Option<PathBuf> {
         None
     } else {
         Some(PathBuf::from(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settings_path_from_values;
+    use std::path::PathBuf;
+
+    #[test]
+    fn windows_prefers_appdata() {
+        let path = settings_path_from_values(
+            Some(PathBuf::from(r"C:\xdg")),
+            Some(PathBuf::from(r"C:\Users\tester")),
+            Some(PathBuf::from(r"C:\Users\tester\AppData\Roaming")),
+            true,
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\Users\tester\AppData\Roaming\lowcat\settings.toml")
+        );
+    }
+
+    #[test]
+    fn windows_falls_back_to_xdg_then_home() {
+        let xdg_path = settings_path_from_values(
+            Some(PathBuf::from(r"C:\xdg")),
+            Some(PathBuf::from(r"C:\Users\tester")),
+            None,
+            true,
+        );
+        assert_eq!(xdg_path, PathBuf::from(r"C:\xdg\lowcat\settings.toml"));
+
+        let home_path =
+            settings_path_from_values(None, Some(PathBuf::from(r"C:\Users\tester")), None, true);
+        assert_eq!(
+            home_path,
+            PathBuf::from(r"C:\Users\tester\.config\lowcat\settings.toml")
+        );
+    }
+
+    #[test]
+    fn unix_prefers_xdg_config_home() {
+        let path = settings_path_from_values(
+            Some(PathBuf::from("/tmp/xdg")),
+            Some(PathBuf::from("/home/tester")),
+            Some(PathBuf::from("/ignored/appdata")),
+            false,
+        );
+
+        assert_eq!(path, PathBuf::from("/tmp/xdg/lowcat/settings.toml"));
+    }
+
+    #[test]
+    fn missing_environment_uses_relative_fallback() {
+        assert_eq!(
+            settings_path_from_values(None, None, None, true),
+            PathBuf::from(".config/lowcat/settings.toml")
+        );
     }
 }

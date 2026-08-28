@@ -1,4 +1,8 @@
 #![allow(unexpected_cfgs)]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod backend;
 mod db;
@@ -14,9 +18,13 @@ mod opus_source;
 mod perf;
 mod preview_player;
 mod preview_waveform;
+#[cfg(target_os = "windows")]
+mod single_instance;
 #[cfg(test)]
 mod test_support;
 mod ui;
+#[cfg(target_os = "windows")]
+mod windows_url_drop;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -26,6 +34,8 @@ use gpui::{
     App, AppContext, Bounds, Entity, KeyBinding, Menu, MenuItem, WindowBounds, WindowOptions,
     actions, px, size,
 };
+#[cfg(target_os = "windows")]
+use gpui_component::GlobalState;
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 use gpui_component_assets::Assets;
 use gpui_platform::application;
@@ -42,6 +52,11 @@ actions!(
 );
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    let Some(_single_instance) = single_instance::SingleInstance::acquire_or_activate() else {
+        return;
+    };
+
     let app = application().with_assets(Assets);
     let main_library = Rc::new(RefCell::new(None::<Entity<Library>>));
     let media_tool_problems = Rc::new(media_tools::missing_required_tools());
@@ -80,28 +95,48 @@ fn main() {
         });
 
         let bindings = [
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-,", ToggleSettings, None),
-            KeyBinding::new("cmd-e", ToggleFilters, None),
-            KeyBinding::new("cmd-i", AssignFolderTags, None),
+            KeyBinding::new(command_shortcut("cmd-q", "ctrl-q"), Quit, None),
+            KeyBinding::new(command_shortcut("cmd-,", "ctrl-,"), ToggleSettings, None),
+            KeyBinding::new(command_shortcut("cmd-e", "ctrl-e"), ToggleFilters, None),
+            KeyBinding::new(command_shortcut("cmd-i", "ctrl-i"), AssignFolderTags, None),
             KeyBinding::new("f2", RenameSelection, None),
-            KeyBinding::new("cmd-d", ToggleFavoriteSelection, None),
+            KeyBinding::new(
+                command_shortcut("cmd-d", "ctrl-d"),
+                ToggleFavoriteSelection,
+                None,
+            ),
             KeyBinding::new("shift-delete", ClearFilterTags, None),
             KeyBinding::new("shift-backspace", ClearFilterTags, None),
-            KeyBinding::new("cmd-shift-delete", ClearFilterTagsAndSearch, None),
-            KeyBinding::new("cmd-shift-backspace", ClearFilterTagsAndSearch, None),
+            KeyBinding::new(
+                command_shortcut("cmd-shift-delete", "ctrl-shift-delete"),
+                ClearFilterTagsAndSearch,
+                None,
+            ),
+            KeyBinding::new(
+                command_shortcut("cmd-shift-backspace", "ctrl-shift-backspace"),
+                ClearFilterTagsAndSearch,
+                None,
+            ),
             KeyBinding::new("shift-e", ToggleDownloader, None),
             KeyBinding::new("ctrl-tab", NextCategory, None),
             KeyBinding::new("ctrl-shift-tab", PreviousCategory, None),
         ];
         cx.bind_keys(bindings);
         bind_macos_window_keys(cx);
-        cx.set_menus(app_menus());
+        install_app_menus(cx);
 
         cx.activate(true);
 
         open_main_window(library, media_tool_problems.clone(), cx);
     })
+}
+
+fn command_shortcut(default: &'static str, windows: &'static str) -> &'static str {
+    if cfg!(target_os = "windows") {
+        windows
+    } else {
+        default
+    }
 }
 
 fn show_main_window(
@@ -133,6 +168,7 @@ fn open_main_window(
             ..Default::default()
         },
         |window, cx| {
+            window.set_window_title("Lowcat");
             let view =
                 cx.new(|cx| UI::new(library, media_tool_problems.as_ref().clone(), window, cx));
             cx.new(|cx| Root::new(view, window, cx))
@@ -205,6 +241,13 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::action("Previous Category", PreviousCategory),
         ]),
     ]
+}
+
+fn install_app_menus(cx: &mut App) {
+    #[cfg(target_os = "windows")]
+    GlobalState::global_mut(cx)
+        .set_app_menus(app_menus().into_iter().map(gpui::Menu::owned).collect());
+    cx.set_menus(app_menus());
 }
 
 fn title_bar_options() -> gpui::TitlebarOptions {

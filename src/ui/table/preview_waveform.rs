@@ -168,7 +168,7 @@ impl Element for PreviewWaveformElement {
                 {
                     return;
                 }
-                let trim_enabled = event.modifiers.platform;
+                let trim_enabled = super::super::command_modifier(&event.modifiers);
                 if event.click_count == 2 && trim_enabled {
                     cx.update_entity(&table, |table, cx| {
                         table.cancel_preview_trim(&path, cx);
@@ -219,7 +219,7 @@ impl Element for PreviewWaveformElement {
                     bounds,
                     PreviewScrubAction::Continue,
                     None,
-                    event.modifiers.platform,
+                    super::super::command_modifier(&event.modifiers),
                     cx,
                 );
                 cx.stop_propagation();
@@ -240,7 +240,7 @@ impl Element for PreviewWaveformElement {
                     bounds,
                     PreviewScrubAction::End,
                     None,
-                    event.modifiers.alt && event.modifiers.platform,
+                    event.modifiers.alt && super::super::command_modifier(&event.modifiers),
                     cx,
                 );
                 cx.stop_propagation();

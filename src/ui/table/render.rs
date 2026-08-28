@@ -669,7 +669,7 @@ impl FileTable {
                                                 );
                                             } else if event.click_count() == 2
                                                 && !modifiers.control
-                                                && !modifiers.platform
+                                                && !super::super::command_modifier(&modifiers)
                                                 && !modifiers.shift
                                                 && !modifiers.function
                                             {
@@ -1066,6 +1066,19 @@ impl Render for FileTable {
                 }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.pending_delete.is_some() {
+                    match delete_modal_key_action(&event.keystroke.key) {
+                        DeleteModalKeyAction::Cancel => {
+                            this.cancel_delete(cx);
+                        }
+                        DeleteModalKeyAction::Confirm => {
+                            this.confirm_pending_delete(cx);
+                        }
+                        DeleteModalKeyAction::Block => {}
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 match event.keystroke.key.as_str() {
                     "escape"
                         if this.cancel_file_drag(window, cx)

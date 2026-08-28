@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn delete_modal_only_accepts_cancel_and_confirm_keys() {
+    assert_eq!(
+        delete_modal_key_action("escape"),
+        DeleteModalKeyAction::Cancel
+    );
+    assert_eq!(
+        delete_modal_key_action("delete"),
+        DeleteModalKeyAction::Confirm
+    );
+    assert_eq!(
+        delete_modal_key_action("enter"),
+        DeleteModalKeyAction::Confirm
+    );
+    for key in ["backspace", "f2", "space", "a", "v"] {
+        assert_eq!(delete_modal_key_action(key), DeleteModalKeyAction::Block);
+    }
+}
+
+#[test]
 fn opt_preview_does_not_activate_during_row_editing() {
     let path = PathBuf::from("/tmp/preview.wav");
 

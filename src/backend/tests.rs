@@ -21,6 +21,21 @@ fn backend(name: &str) -> Backend {
     Backend::new(unique_db(name)).unwrap()
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+fn trash_works_from_multithreaded_com_worker() {
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.unwrap();
+    let dir = unique_dir("windows-trash-mta");
+    let path = dir.join("delete-me.txt");
+    fs::write(&path, b"lowcat trash test").unwrap();
+
+    assert_eq!(Backend::trash_files(vec![path.clone()]).unwrap(), 1);
+    assert!(!path.exists());
+    fs::remove_dir(dir).unwrap();
+}
+
 fn fixture(dir: &Path, name: &str, tags: &[(&str, &str)]) -> PathBuf {
     let path = dir.join(name);
     let mut command = Command::new("ffmpeg");

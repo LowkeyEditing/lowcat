@@ -19,12 +19,31 @@ sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "run
 symphonia = { version = "0.5.5", default-features = false, features = ["ogg"] }
 symphonia-adapter-libopus = "0.2.9"
 toml = "0.8.23"
-trash = "5.2"
+trash = { version = "5.2", default-features = false, features = ["coinit_multithreaded"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"
 objc = "0.2"
 raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+drag = "2.1.1"
+raw-window-handle = "0.6"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.61"
+winreg = "0.55"
 
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["test-support"] }

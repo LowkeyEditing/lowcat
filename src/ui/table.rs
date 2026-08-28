@@ -62,6 +62,21 @@ const CONVERT_MENU_PANE_WIDTH: f32 = 160.;
 const ROW_HEIGHT: Pixels = px(32.);
 const TRIM_DRAG_THRESHOLD_PX: f32 = 4.;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DeleteModalKeyAction {
+    Cancel,
+    Confirm,
+    Block,
+}
+
+pub(super) fn delete_modal_key_action(key: &str) -> DeleteModalKeyAction {
+    match key {
+        "escape" => DeleteModalKeyAction::Cancel,
+        "delete" | "enter" => DeleteModalKeyAction::Confirm,
+        _ => DeleteModalKeyAction::Block,
+    }
+}
+
 fn favorite_row_highlighted(favorite: bool, _favorites_only: bool) -> bool {
     favorite
 }
@@ -2164,6 +2179,7 @@ impl FileTable {
                 drag_paths.clone(),
                 native_drag_label,
                 window,
+                cx,
                 move |end| {
                     finished_session.finish();
                     let _ = drag_finished_tx.unbounded_send(end);

@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
-    prelude::FluentBuilder, red, relative,
+    App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task,
+    Window, div, prelude::FluentBuilder, red, relative,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Selectable, Sizable, StyledExt,
@@ -88,9 +88,11 @@ impl Toolbar {
         }
     }
 
-    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> FocusHandle {
+        let focus_handle = self.search_input.read(cx).focus_handle(cx);
         self.search_input
             .update(cx, |state, cx| state.focus(window, cx));
+        focus_handle
     }
 
     pub fn search_is_focused(&self, window: &Window, cx: &App) -> bool {

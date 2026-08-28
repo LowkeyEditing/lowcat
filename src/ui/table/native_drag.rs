@@ -1,18 +1,53 @@
 use std::path::PathBuf;
 
-use gpui::Window;
+use gpui::{App, Window};
 
 #[cfg(target_os = "macos")]
 pub(super) use macos::{DragEnd, StartDragError, cancel_gpui_drag, cancel_native_drag};
+
+#[cfg(target_os = "windows")]
+pub(super) use windows::{DragEnd, StartDragError, cancel_gpui_drag, cancel_native_drag};
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(super) use unsupported::{DragEnd, StartDragError, cancel_gpui_drag, cancel_native_drag};
 
 #[cfg(target_os = "macos")]
 pub(super) fn start_file_drag(
     paths: Vec<PathBuf>,
     label: String,
     window: &mut Window,
+    _cx: &mut App,
     on_finish: impl Fn(DragEnd) + Send + 'static,
 ) -> Result<(), StartDragError> {
     macos::start_file_drag(paths, label, window, on_finish)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn start_file_drag(
+    paths: Vec<PathBuf>,
+    label: String,
+    window: &mut Window,
+    cx: &mut App,
+    on_finish: impl Fn(DragEnd) + Send + 'static,
+) -> Result<(), StartDragError> {
+    windows::start_file_drag(
+        paths,
+        label,
+        window,
+        cx.foreground_executor().clone(),
+        on_finish,
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(super) fn start_file_drag(
+    paths: Vec<PathBuf>,
+    label: String,
+    window: &mut Window,
+    _cx: &mut App,
+    on_finish: impl Fn(DragEnd) + Send + 'static,
+) -> Result<(), StartDragError> {
+    unsupported::start_file_drag(paths, label, window, on_finish)
 }
 
 #[cfg(target_os = "macos")]
@@ -612,4 +647,220 @@ mod macos {
             assert_eq!(size.height, DRAG_PREVIEW_HEIGHT);
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use std::{
+        fmt,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use drag::{DragItem, DragMode, Image, Options};
+    use gpui::{ForegroundExecutor, Window};
+    use raw_window_handle::{
+        HasWindowHandle as _, RawWindowHandle, Win32WindowHandle, WindowHandle,
+    };
+
+    static NATIVE_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) struct DragEnd;
+
+    #[derive(Debug)]
+    pub(crate) enum StartDragError {
+        EmptyFileList,
+        UnsupportedWindow,
+        Native(drag::Error),
+    }
+
+    impl fmt::Display for StartDragError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::EmptyFileList => f.write_str("no existing files can be dragged"),
+                Self::UnsupportedWindow => f.write_str("Lowcat window is not a Win32 window"),
+                Self::Native(error) => write!(f, "Windows drag-and-drop failed: {error}"),
+            }
+        }
+    }
+
+    pub(super) fn start_file_drag(
+        paths: Vec<PathBuf>,
+        _label: String,
+        window: &mut Window,
+        foreground_executor: ForegroundExecutor,
+        on_finish: impl Fn(DragEnd) + Send + 'static,
+    ) -> Result<(), StartDragError> {
+        let start = crate::perf::start();
+        let files = absolute_files(paths);
+        if files.is_empty() {
+            crate::perf::finish("native_drag.prepare", start, || "files=0".to_string());
+            return Err(StartDragError::EmptyFileList);
+        }
+        let file_count = files.len();
+        crate::perf::finish("native_drag.prepare", start, || {
+            format!("files={file_count}")
+        });
+
+        let handle = window
+            .window_handle()
+            .map_err(|_| StartDragError::UnsupportedWindow)?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return Err(StartDragError::UnsupportedWindow);
+        };
+        let window_handle = OwnedWin32WindowHandle(handle);
+        let finish = Arc::new(Mutex::new(Some(on_finish)));
+
+        NATIVE_DRAG_ACTIVE.store(true, Ordering::Release);
+        foreground_executor
+            .spawn(async move {
+                super::super::debug_table_interaction(|| {
+                    format!(
+                        "native drag loop enter thread={:?}",
+                        std::thread::current().id()
+                    )
+                });
+                let callback_finish = finish.clone();
+                let result = drag::start_drag(
+                    &window_handle,
+                    DragItem::Files(files),
+                    Image::Raw(
+                        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/logo.png"))
+                            .to_vec(),
+                    ),
+                    move |_, _| finish_once(&callback_finish),
+                    Options {
+                        mode: DragMode::Copy,
+                        ..Options::default()
+                    },
+                )
+                .map_err(StartDragError::Native);
+                super::super::debug_table_interaction(|| {
+                    format!(
+                        "native drag loop return ok={} thread={:?}",
+                        result.is_ok(),
+                        std::thread::current().id()
+                    )
+                });
+
+                if let Err(error) = result {
+                    super::super::debug_table_interaction(|| {
+                        format!("native drag failed after scheduling: {error}")
+                    });
+                    finish_once(&finish);
+                }
+            })
+            .detach();
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    struct OwnedWin32WindowHandle(Win32WindowHandle);
+
+    impl raw_window_handle::HasWindowHandle for OwnedWin32WindowHandle {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, raw_window_handle::HandleError> {
+            // SAFETY: Lowcat owns the HWND and keeps its main window alive for the
+            // duration of the drag. The foreground task runs on the HWND's thread.
+            Ok(unsafe { WindowHandle::borrow_raw(self.0.into()) })
+        }
+    }
+
+    fn finish_once(callback: &Arc<Mutex<Option<impl Fn(DragEnd)>>>) {
+        let callback = callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(callback) = callback {
+            NATIVE_DRAG_ACTIVE.store(false, Ordering::Release);
+            callback(DragEnd);
+        }
+    }
+
+    pub(crate) fn cancel_native_drag(_window: &mut Window) -> bool {
+        // The Windows OLE drag loop handles Escape and button release itself.
+        // There is no separate GPUI event loop callback while DoDragDrop runs.
+        NATIVE_DRAG_ACTIVE.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cancel_gpui_drag(_window: &mut Window) {}
+
+    fn absolute_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                if !path.is_file() {
+                    return None;
+                }
+                if path.is_absolute() {
+                    Some(path)
+                } else {
+                    path.canonicalize().ok()
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+
+        #[test]
+        fn nonexistent_paths_are_not_dragged() {
+            let missing = std::path::Path::new("C:\\lowcat\\does-not-exist.wav");
+            assert!(absolute_files(vec![missing.to_path_buf()]).is_empty());
+        }
+
+        #[test]
+        fn native_drag_completion_only_runs_once() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = calls.clone();
+            let callback = Arc::new(Mutex::new(Some(move |_| {
+                callback_calls.fetch_add(1, Ordering::AcqRel);
+            })));
+            NATIVE_DRAG_ACTIVE.store(true, Ordering::Release);
+
+            finish_once(&callback);
+            finish_once(&callback);
+
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            assert!(!NATIVE_DRAG_ACTIVE.load(Ordering::Acquire));
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod unsupported {
+    use std::{fmt, path::PathBuf};
+
+    use gpui::Window;
+
+    pub(crate) struct DragEnd;
+
+    #[derive(Debug)]
+    pub(crate) struct StartDragError;
+
+    impl fmt::Display for StartDragError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("native file dragging is not supported on this platform")
+        }
+    }
+
+    pub(super) fn start_file_drag(
+        _paths: Vec<PathBuf>,
+        _label: String,
+        _window: &mut Window,
+        _on_finish: impl Fn(DragEnd) + Send + 'static,
+    ) -> Result<(), StartDragError> {
+        Err(StartDragError)
+    }
+
+    pub(crate) fn cancel_native_drag(_window: &mut Window) -> bool {
+        false
+    }
+
+    pub(crate) fn cancel_gpui_drag(_window: &mut Window) {}
 }

@@ -142,11 +142,39 @@ pub fn download_audio(
     cancel: DownloadCancel,
     mut on_progress: impl FnMut(DownloadProgressEvent),
 ) -> Result<(), DownloadError> {
+    debug_ytdlp(|| {
+        format!(
+            "download_begin url={} folder={} format={} canceled={}",
+            request.url,
+            request.folder.display(),
+            request.format.extension(),
+            cancel.is_canceled()
+        )
+    });
     on_progress(DownloadProgressEvent::Progress(0.));
 
-    fs::create_dir_all(&request.folder).map_err(|_| DownloadError::failed("Download failed"))?;
+    fs::create_dir_all(&request.folder).map_err(|error| {
+        debug_ytdlp(|| {
+            format!(
+                "create_destination_failed folder={} kind={:?} error={error}",
+                request.folder.display(),
+                error.kind()
+            )
+        });
+        DownloadError::failed("Download failed")
+    })?;
     let temp_dir = temp_download_dir(&request.folder);
-    fs::create_dir_all(&temp_dir).map_err(|_| DownloadError::failed("Download failed"))?;
+    fs::create_dir_all(&temp_dir).map_err(|error| {
+        debug_ytdlp(|| {
+            format!(
+                "create_temp_failed temp={} kind={:?} error={error}",
+                temp_dir.display(),
+                error.kind()
+            )
+        });
+        DownloadError::failed("Download failed")
+    })?;
+    debug_ytdlp(|| format!("temp_created path={}", temp_dir.display()));
 
     let mut child = spawn_ytdlp(&request, &temp_dir).map_err(|error| {
         debug_ytdlp(|| format!("spawn_failed kind={:?} error={}", error.kind(), error));
@@ -157,6 +185,14 @@ pub fn download_audio(
             DownloadError::failed("Download failed")
         }
     })?;
+    debug_ytdlp(|| {
+        format!(
+            "spawned pid={} stdout_piped={} stderr_piped={}",
+            child.id(),
+            child.stdout.is_some(),
+            child.stderr.is_some()
+        )
+    });
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -175,8 +211,10 @@ pub fn download_audio(
 
     let mut output_path = None;
     let mut error_text = String::new();
+    let mut line_channel_disconnected = false;
     loop {
         if cancel.is_canceled() {
+            debug_ytdlp(|| format!("cancel_observed pid={}", child.id()));
             terminate_child(&mut child);
             join_readers(reader_threads);
             cleanup_temp_dir(&temp_dir);
@@ -191,6 +229,7 @@ pub fn download_audio(
                 }
                 cleanup_temp_dir(&temp_dir);
                 if cancel.is_canceled() {
+                    debug_ytdlp(|| "cancel_observed_after_exit".to_string());
                     return Err(DownloadError::canceled());
                 }
                 debug_ytdlp(|| {
@@ -210,9 +249,17 @@ pub fn download_audio(
                         return Err(DownloadError::failed("Download failed"));
                     }
                     on_progress(DownloadProgressEvent::Progress(100.));
+                    debug_ytdlp(|| "download_complete".to_string());
                     return Ok(());
                 }
-                return Err(classify_ytdlp_error(&error_text));
+                let error = classify_ytdlp_error(&error_text);
+                debug_ytdlp(|| {
+                    format!(
+                        "download_error kind={:?} message={}",
+                        error.kind, error.message
+                    )
+                });
+                return Err(error);
             }
             Ok(None) => {}
             Err(error) => {
@@ -229,7 +276,12 @@ pub fn download_audio(
                 apply_ytdlp_line(&line, &mut on_progress, &mut output_path, &mut error_text);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if !line_channel_disconnected {
+                    line_channel_disconnected = true;
+                    debug_ytdlp(|| "line_channel_disconnected".to_string());
+                }
+            }
         }
     }
 }
@@ -272,9 +324,15 @@ fn spawn_ytdlp(request: &DownloadRequest, temp_dir: &std::path::Path) -> io::Res
     command.arg(&request.url);
 
     debug_ytdlp(|| {
+        let args = command
+            .get_args()
+            .map(|arg| format!("{:?}", arg))
+            .collect::<Vec<_>>()
+            .join(" ");
         format!(
-            "spawn program={} ffmpeg_location={} folder={} temp={} format={} path={}",
+            "spawn program={:?} args={} ffmpeg_location={} folder={} temp={} format={} path={}",
             command.get_program().to_string_lossy(),
+            args,
             ffmpeg_location
                 .as_ref()
                 .map(|path| path.display().to_string())
@@ -334,6 +392,15 @@ enum StreamKind {
     Stderr,
 }
 
+impl StreamKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ProcessLine {
     stream: StreamKind,
@@ -346,18 +413,29 @@ fn spawn_line_reader(
     line_tx: mpsc::Sender<ProcessLine>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            let _ = line_tx.send(ProcessLine {
-                stream: kind,
-                text: line,
-            });
+        for line in BufReader::new(stream).lines() {
+            match line {
+                Ok(text) => {
+                    if line_tx.send(ProcessLine { stream: kind, text }).is_err() {
+                        debug_ytdlp(|| format!("reader_receiver_dropped stream={}", kind.label()));
+                        return;
+                    }
+                }
+                Err(error) => {
+                    debug_ytdlp(|| format!("reader_failed stream={} error={error}", kind.label()));
+                    return;
+                }
+            }
         }
+        debug_ytdlp(|| format!("reader_eof stream={}", kind.label()));
     })
 }
 
 fn join_readers(reader_threads: Vec<thread::JoinHandle<()>>) {
     for reader_thread in reader_threads {
-        let _ = reader_thread.join();
+        if reader_thread.join().is_err() {
+            debug_ytdlp(|| "reader_panicked".to_string());
+        }
     }
 }
 
@@ -367,18 +445,23 @@ fn apply_ytdlp_line(
     output_path: &mut Option<PathBuf>,
     error_text: &mut String,
 ) {
+    debug_ytdlp(|| format!("{}: {}", line.stream.label(), line.text));
     match line.stream {
         StreamKind::Stdout => {
             if let Some(title) = parse_ytdlp_title(&line.text) {
+                debug_ytdlp(|| format!("parsed_title value={title}"));
                 on_progress(DownloadProgressEvent::Label(title.to_string()));
             }
             if let Some(progress) = parse_ytdlp_progress(&line.text) {
+                debug_ytdlp(|| format!("parsed_progress value={progress}"));
                 on_progress(DownloadProgressEvent::Progress(progress));
             }
             if let Some(label) = parse_ytdlp_destination_label(&line.text) {
+                debug_ytdlp(|| format!("parsed_destination_label value={label}"));
                 on_progress(DownloadProgressEvent::Label(label));
             }
             if let Some(path) = parse_ytdlp_output_path(&line.text) {
+                debug_ytdlp(|| format!("parsed_output_path value={path}"));
                 *output_path = Some(PathBuf::from(path));
             }
         }
@@ -450,12 +533,30 @@ fn classify_ytdlp_error(stderr: &str) -> DownloadError {
 }
 
 fn terminate_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+    let pid = child.id();
+    match child.kill() {
+        Ok(()) => debug_ytdlp(|| format!("kill_sent pid={pid}")),
+        Err(error) => debug_ytdlp(|| format!("kill_failed pid={pid} error={error}")),
+    }
+    match child.wait() {
+        Ok(status) => debug_ytdlp(|| format!("killed_child_reaped pid={pid} status={status}")),
+        Err(error) => debug_ytdlp(|| format!("reap_failed pid={pid} error={error}")),
+    }
 }
 
 fn cleanup_temp_dir(temp_dir: &std::path::Path) {
-    let _ = fs::remove_dir_all(temp_dir);
+    match fs::remove_dir_all(temp_dir) {
+        Ok(()) => debug_ytdlp(|| format!("temp_removed path={}", temp_dir.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            debug_ytdlp(|| format!("temp_already_absent path={}", temp_dir.display()))
+        }
+        Err(error) => debug_ytdlp(|| {
+            format!(
+                "temp_remove_failed path={} error={error}",
+                temp_dir.display()
+            )
+        }),
+    }
 }
 
 fn temp_download_dir(folder: &std::path::Path) -> PathBuf {

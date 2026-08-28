@@ -14,3 +14,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+
+  test-windows:
+    name: Test Windows build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install media tools
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y
+          py -m pip install yt-dlp
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
+      - run: cargo test --locked

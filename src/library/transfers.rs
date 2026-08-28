@@ -126,33 +126,56 @@ impl Library {
             label: "Preparing download".to_string(),
             progress: 0.,
         });
-        debug_downloader_interaction(|| format!("download_start category={}", category.label()));
+        debug_downloader_interaction(|| {
+            format!(
+                "download_start category={} url={} folder={} format={}",
+                category.label(),
+                request.url,
+                request.folder.display(),
+                request.format.extension()
+            )
+        });
         cx.notify();
 
         let (progress_tx, mut progress_rx) = mpsc::unbounded();
         cx.spawn(async move |this, cx| {
             while let Some(event) = progress_rx.next().await {
-                this.update(cx, |lib, cx| {
+                debug_downloader_interaction(|| format!("progress_received event={event:?}"));
+                if let Err(error) = this.update(cx, |lib, cx| {
                     lib.apply_download_progress(event, cx);
-                })
-                .ok();
+                }) {
+                    debug_downloader_interaction(|| {
+                        format!("progress_ui_update_failed error={error}")
+                    });
+                    return;
+                }
             }
+            debug_downloader_interaction(|| "progress_channel_closed".to_string());
         })
         .detach();
 
         let download_task = cx.background_spawn(async move {
+            debug_downloader_interaction(|| "background_download_started".to_string());
             let result = downloader::download_audio(request, cancel, |event| {
-                let _ = progress_tx.unbounded_send(event);
+                if let Err(error) = progress_tx.unbounded_send(event) {
+                    debug_downloader_interaction(|| format!("progress_send_failed error={error}"));
+                }
+            });
+            debug_downloader_interaction(|| {
+                format!("background_download_finished result={result:?}")
             });
             DownloadBatchResult { category, result }
         });
 
         cx.spawn(async move |this, cx| {
             let result = download_task.await;
-            this.update(cx, |lib, cx| {
+            if let Err(error) = this.update(cx, |lib, cx| {
                 lib.finish_download(result, cx);
-            })
-            .ok();
+            }) {
+                debug_downloader_interaction(|| {
+                    format!("download_finish_ui_update_failed error={error}")
+                });
+            }
         })
         .detach();
     }
@@ -362,11 +385,20 @@ impl Library {
 
         let category = self.active;
         let file_count = paths.len();
+        crate::diagnostics::debug("trash", || {
+            format!(
+                "start category={} files={} paths={paths:?}",
+                category.label(),
+                file_count
+            )
+        });
         self.invalidate_trim_generations(&paths);
         let trash_paths = paths.clone();
 
         let trash_task = cx.background_spawn(async move {
+            crate::diagnostics::debug("trash", || "background_started".to_string());
             let result = Backend::trash_files(paths);
+            crate::diagnostics::debug("trash", || format!("background_finished result={result:?}"));
             TrashBatchResult {
                 category,
                 file_count,
@@ -414,6 +446,9 @@ impl Library {
 
     fn apply_download_progress(&mut self, event: DownloadProgressEvent, cx: &mut Context<Self>) {
         let DownloadState::Running(status) = &mut self.download_state else {
+            debug_downloader_interaction(|| {
+                format!("progress_ignored state_not_running event={event:?}")
+            });
             return;
         };
 
@@ -435,7 +470,14 @@ impl Library {
         match result.result {
             Ok(()) => {
                 self.download_state = DownloadState::Idle;
-                let _ = self.backend.refresh_category(result.category);
+                if let Err(error) = self.backend.refresh_category(result.category) {
+                    debug_downloader_interaction(|| {
+                        format!(
+                            "download_refresh_failed category={} error={error}",
+                            result.category.label()
+                        )
+                    });
+                }
                 self.refresh_category_state(result.category);
                 self.maybe_start_waveform_cache(cx);
                 debug_downloader_interaction(|| {
@@ -571,6 +613,14 @@ impl Library {
     }
 
     fn finish_trash_files(&mut self, result: TrashBatchResult, cx: &mut Context<Self>) {
+        crate::diagnostics::debug("trash", || {
+            format!(
+                "finish category={} requested={} result={:?}",
+                result.category.label(),
+                result.file_count,
+                result.result
+            )
+        });
         self.clear_import_priority();
         match result.result {
             Ok(_) => {

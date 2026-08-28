@@ -215,7 +215,11 @@ impl UI {
         cx: &mut Context<Self>,
     ) {
         if let Some(modal) = self.folder_tag_modal.as_mut() {
-            modal.select_row(index, event.modifiers.shift, event.modifiers.platform);
+            modal.select_row(
+                index,
+                event.modifiers.shift,
+                super::command_modifier(&event.modifiers),
+            );
             modal.close_key_menu();
             cx.notify();
         }
