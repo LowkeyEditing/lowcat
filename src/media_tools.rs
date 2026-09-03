@@ -35,10 +35,14 @@ pub fn command(tool: &str) -> Command {
         return command;
     }
 
-    let mut command = Command::new(executable);
     #[cfg(target_os = "windows")]
-    suppress_windows_console(&mut command);
-    command
+    {
+        let mut command = Command::new(executable);
+        suppress_windows_console(&mut command);
+        return command;
+    }
+
+    Command::new(executable)
 }
 
 #[cfg(target_os = "windows")]
@@ -377,6 +381,7 @@ fn version_arg(tool: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
     use super::*;
 
     #[cfg(target_os = "windows")]

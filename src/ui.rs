@@ -1,4 +1,5 @@
 mod downloader_panel;
+#[cfg(target_os = "windows")]
 pub(crate) mod drop_overlay;
 mod filter_panel;
 mod folder_tags;
@@ -458,16 +459,20 @@ impl Render for UI {
             .relative()
             .size_full()
             .v_flex()
-            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
-                this.toolbar.update(cx, |toolbar, cx| {
-                    toolbar.set_alt_down(event.modifiers.alt, cx)
-                });
-                this.table
-                    .update(cx, |table, cx| table.set_alt_down(event.modifiers.alt, cx));
-                this.table.update(cx, |table, cx| {
-                    table.set_cmd_down(command_modifier(&event.modifiers), cx)
-                });
-            }))
+            .on_modifiers_changed(
+                cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
+                    let mouse_position = window.mouse_position();
+                    let viewport_size = window.viewport_size();
+                    this.toolbar.update(cx, |toolbar, cx| {
+                        toolbar.set_alt_down(event.modifiers.alt, cx)
+                    });
+                    this.table.update(cx, |table, cx| {
+                        table.clear_pointer_hover_if_outside(mouse_position, viewport_size, cx);
+                        table.set_alt_down(event.modifiers.alt, cx);
+                        table.set_cmd_down(command_modifier(&event.modifiers), cx);
+                    });
+                }),
+            )
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_action(cx.listener(|this, _: &ToggleFilters, window, cx| {
                 if this.has_media_tool_problems() {

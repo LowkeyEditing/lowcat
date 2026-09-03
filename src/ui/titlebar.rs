@@ -263,7 +263,7 @@ impl AppTitleBar {
 }
 
 impl Render for AppTitleBar {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_start = crate::perf::start();
         let active = self.library.read(cx).active();
         let internal_drag_active = self.library.read(cx).internal_file_drag_active();

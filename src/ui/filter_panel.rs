@@ -1,6 +1,8 @@
+use std::{cell::Cell, rc::Rc};
+
 use gpui::{
-    Context, Entity, InteractiveElement as _, IntoElement, Keystroke, ParentElement, Render,
-    SharedString, Styled, Window, div, prelude::FluentBuilder as _,
+    Context, Entity, InteractiveElement as _, IntoElement, Keystroke, MouseButton, ParentElement,
+    Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
     ActiveTheme as _, Selectable as _, Sizable as _, StyledExt,
@@ -192,6 +194,8 @@ impl Render for FilterPanel {
             })
             .collect();
         let all_groups_visible = menu_visibility.iter().all(|(_, visible)| *visible);
+        let child_context_menu_claimed = Rc::new(Cell::new(false));
+        let panel_context_menu_claimed = child_context_menu_claimed.clone();
         let mut panel = div()
             .v_flex()
             .w_full()
@@ -200,6 +204,9 @@ impl Render for FilterPanel {
             .py_1()
             .gap_2()
             .context_menu(move |mut menu, _, _| {
+                if panel_context_menu_claimed.replace(false) {
+                    return menu;
+                }
                 for (key, visible) in &menu_visibility {
                     let library = menu_library.clone();
                     menu = menu.item(PopupMenuItem::new(key.clone()).checked(*visible).on_click({
@@ -275,6 +282,7 @@ impl Render for FilterPanel {
                 let intersection_library = self.library.clone();
                 let intersection_key = key.clone();
                 let intersection_value = value.clone();
+                let chip_context_menu_claimed = child_context_menu_claimed.clone();
                 let intersection_checked =
                     self.library.read(cx).tag_shows_on_intersection(key, value);
                 let display_value = split_subtag(value)
@@ -309,6 +317,9 @@ impl Render for FilterPanel {
                                 lib.toggle_value(&key, &value, cx);
                             });
                         }))
+                        .on_mouse_down(MouseButton::Right, move |_, _, _| {
+                            chip_context_menu_claimed.set(true);
+                        })
                         .context_menu(move |menu, _, _| {
                             let library = intersection_library.clone();
                             let key = intersection_key.clone();

@@ -1034,18 +1034,22 @@ impl Render for FileTable {
                 .into_any_element()
         };
         let table_for_window_boundary = cx.entity();
-        let native_drag_on_window_boundary = canvas(
+        let window_pointer_events = canvas(
             |_, _, _| (),
             move |_, _, window, _| {
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Capture
-                        && event.dragging()
-                        && is_pointer_outside_window(event.position, window.viewport_size())
+                    if phase != DispatchPhase::Capture
+                        || !is_pointer_outside_window(event.position, window.viewport_size())
                     {
-                        table_for_window_boundary.update(cx, |this, cx| {
-                            this.start_native_file_drag(window, cx);
-                        });
+                        return;
                     }
+                    table_for_window_boundary.update(cx, |this, cx| {
+                        if event.dragging() {
+                            this.start_native_file_drag(window, cx);
+                        } else {
+                            this.clear_pointer_hover(cx);
+                        }
+                    });
                 });
             },
         )
@@ -1121,7 +1125,7 @@ impl Render for FileTable {
                     .min_h_0()
                     .child(div().size_full().child(rows)),
             )
-            .child(native_drag_on_window_boundary);
+            .child(window_pointer_events);
 
         crate::perf::finish("table.render", render_start, || {
             format!(

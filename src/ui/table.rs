@@ -2032,6 +2032,29 @@ impl FileTable {
         }
     }
 
+    fn clear_pointer_hover(&mut self, cx: &mut Context<Self>) {
+        let row_hovered = self.hovered_row.take().is_some();
+        let tag_chip_hovered = self.hovered_tag_chip.take().is_some();
+        let tag_key_hovered = self.hovered_tag_key.take().is_some();
+        let format_chip_hovered = self.hovered_format_chip.take().is_some();
+        let had_hover = row_hovered || tag_chip_hovered || tag_key_hovered || format_chip_hovered;
+        self.update_preview_active_row(cx);
+        if had_hover {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn clear_pointer_hover_if_outside(
+        &mut self,
+        position: Point<Pixels>,
+        viewport_size: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if is_pointer_outside_window(position, viewport_size) {
+            self.clear_pointer_hover(cx);
+        }
+    }
+
     pub(crate) fn cancel_file_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let native_drag_active = self.native_drag_session.is_active();
         let had_drag = self.pending_drag.is_some()
